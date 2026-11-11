@@ -18,10 +18,12 @@ from ..crafting.profit import (
     rank_crafts,
 )
 from ..crafting.recipes import Recipe, load_vanilla_recipes, load_wowhead_recipes, merge_recipes
+from ..market.myhouse import house_source, load_my_houses
 from ..planner.engine import PlanOptions
-from ..planner.pricing import PriceBook, build_price_book, pick_houses
+from ..planner.pricing import PriceBook, build_price_book, cap_prices, pick_houses
 from ..planner.profile import CharacterProfile
 from ..wowhead.sources import ItemSource, load_sources
+from ..wowhead.vendors import VendorOffer, load_vendor_offers
 from . import vanilla
 from .discover import (
     Candidate,
@@ -107,10 +109,16 @@ class DiscoverResult:
     sales_coverage_h: float = 0.0
     sweep: bool = False
     book: PriceBook | None = None  # prices and sell rates the farms were scored with
+    capped: dict[int, VendorOffer] = field(default_factory=dict)  # AH prices capped by vendors
+    house_source: str = "guess"  # chosen | configured | confirmed | guess
 
     @property
     def hidden_elite_leads(self) -> int:
         return len({(u.source_type, u.source_id) for u in self.unplaced if u.elite})
+
+
+def _caps(offers: dict[int, VendorOffer]) -> dict[int, float]:
+    return {i: o.price for i, o in offers.items() if not o.limited}
 
 
 def run_discover(
@@ -133,7 +141,8 @@ def run_discover(
 
     Raises FileNotFoundError without the vanilla DB, LookupError without AH data."""
     data, item_ids, placed, unplaced = cache.with_captures()
-    house_ids = pick_houses(conn, region, profile.faction, house, configured_houses)
+    mine = load_my_houses(cache.data_dir, region)
+    house_ids = pick_houses(conn, region, profile.faction, house, configured_houses, mine)
     if not house_ids:
         raise LookupError("no auction data for that faction; run `wowgold collect --once`")
     recipes, ctx = [], None
@@ -141,6 +150,10 @@ def run_discover(
         recipes, ctx, _ = cache.crafting()
         item_ids = item_ids | {i for r in recipes for i in r.item_ids}
     book = build_price_book(conn, region, house_ids, item_ids)
+    offers = load_vendor_offers(cache.data_dir)
+    capped = cap_prices(book, _caps(offers))
+    if ctx is not None:
+        ctx = ctx.with_offers(offers)
     craft_opts = CraftOptions(sell_days=opts.sell_days, market_share=opts.market_share)
     out = DiscoverResult(
         profile=profile,
@@ -150,6 +163,10 @@ def run_discover(
         sales_coverage_h=book.sales_coverage_h,
         sweep=bool(levels),
         book=book,
+        capped={i: offers[i] for i in capped},
+        house_source=house_source(
+            house_ids, profile.faction, explicit=house, configured=configured_houses, mine=mine
+        ),
     )
     for level in levels or [profile.level]:
         at = profile_at_level(profile, level) if levels else profile
@@ -176,6 +193,8 @@ class CraftingResult:
     recipes_total: int
     recipes_forever: int
     sales_coverage_h: float
+    capped: dict[int, VendorOffer] = field(default_factory=dict)
+    house_source: str = "guess"
 
 
 def run_crafting(
@@ -197,12 +216,16 @@ def run_crafting(
     bring yourself. Raises FileNotFoundError without the vanilla DB, LookupError without AH
     data."""
     recipes, ctx, n_forever = cache.crafting()
-    house_ids = pick_houses(conn, region, faction, house, configured_houses)
+    mine = load_my_houses(cache.data_dir, region)
+    house_ids = pick_houses(conn, region, faction, house, configured_houses, mine)
     if not house_ids:
         raise LookupError("no auction data for that faction; run `wowgold collect --once`")
     item_ids = {i for r in recipes for i in r.item_ids}
     item_ids |= {ls.item_id for r in recipes for ls in r.learn if ls.item_id}
     book = build_price_book(conn, region, house_ids, item_ids)
+    offers = load_vendor_offers(cache.data_dir)
+    capped = cap_prices(book, _caps(offers))
+    ctx = ctx.with_offers(offers)
     crafts = rank_crafts(
         recipes,
         book,
@@ -222,4 +245,8 @@ def run_crafting(
         recipes_total=len(recipes),
         recipes_forever=n_forever,
         sales_coverage_h=book.sales_coverage_h,
+        capped={i: offers[i] for i in capped},
+        house_source=house_source(
+            house_ids, faction, explicit=house, configured=configured_houses, mine=mine
+        ),
     )

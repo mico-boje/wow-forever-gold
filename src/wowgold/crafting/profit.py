@@ -10,10 +10,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from ..discovery.vanilla import VItem
-from ..planner.pricing import AH_CUT, PriceBook
+from ..planner.pricing import PriceBook
 from .recipes import Recipe
 
 # Upper bound on crafts per day when nothing else limits it (vendor-sold output, vendor mats):
@@ -34,6 +34,23 @@ class CraftContext:
     vendor_items: frozenset[int]  # items vendors sell (unlimited supply)
     vendor_price: dict[int, int]  # item -> vendor price (what you pay)
     items: dict[int, VItem]  # vanilla item metadata (quality/class), may be partial
+    vendor_names: dict[int, str] = field(default_factory=dict)  # Forever vendors, by item
+
+    def with_offers(self, offers) -> CraftContext:
+        """Add Forever vendor offers (unlimited stock) captured from Wowhead."""
+        unlimited = {i: o for i, o in offers.items() if not o.limited}
+        prices = dict(self.vendor_price)
+        names = dict(self.vendor_names)
+        for i, o in unlimited.items():
+            if i not in prices or o.price < prices[i] or i not in self.vendor_items:
+                prices[i] = round(o.price)
+                names[i] = o.vendor
+        return replace(
+            self,
+            vendor_items=self.vendor_items | frozenset(unlimited),
+            vendor_price=prices,
+            vendor_names=names,
+        )
 
 
 @dataclass
@@ -128,7 +145,8 @@ def buy_price(item_id: int, book: PriceBook, ctx: CraftContext) -> tuple[float |
     vendor = ctx.vendor_price.get(item_id) if item_id in ctx.vendor_items else None
     ah = price.market
     if vendor and (ah is None or vendor <= ah):
-        return float(vendor), "vendor", price.listed_qty
+        name = ctx.vendor_names.get(item_id)
+        return float(vendor), f"vendor ({name})" if name else "vendor", price.listed_qty
     if ah:
         return float(ah), "AH", price.listed_qty
     return None, "missing", 0
@@ -140,7 +158,7 @@ def sell_unit(item_id: int, book: PriceBook, ctx: CraftContext) -> tuple[float, 
     vendor = price.vendor_sell or (ctx.items[item_id].sell_price if item_id in ctx.items else 0)
     if vendor_only(ctx.items.get(item_id)) or not price.market:
         return float(vendor), False
-    net = price.market * (1 - AH_CUT)
+    net = price.market * (1 - price.cut)
     return (net, True) if net > vendor else (float(vendor), False)
 
 

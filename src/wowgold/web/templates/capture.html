@@ -19,12 +19,35 @@
 {% if error %}<div class="note bad">{{ error }}</div>{% endif %}
 {% else %}
 <h1>Wowhead capture</h1>
+{% if last and last.version < script_version %}
+<div class="note bad"><strong>Your userscript is outdated</strong> (version {{ last.version }}; the app needs {{ script_version }}). Recipe list pages aren't captured until you update it: open <a href="/wowgold-capture.user.js">the userscript</a> and click <em>Reinstall</em> / <em>Update</em> in Tampermonkey or Violentmonkey, then reload the Wowhead tabs.</div>
+{% endif %}
 <p><a href="/farms">Verify specific farms instead</a> <span class="muted small">(Farms page → Verify on Wowhead)</span></p>
 <ol>
   <li>Install the <a href="/wowgold-capture.user.js">userscript</a> in Tampermonkey or Violentmonkey (once). It only runs on Wowhead Forever item, NPC and object pages, and only sends to this app.</li>
   <li>Open the items below. A green "wowgold: saved" badge on the Wowhead page means it was captured. Captures feed the <a href="/farms">Farms</a> page right away.</li>
   <li>Skip anything crafted (bags, blueprints, bars, dyes): only drops and gathered items help.</li>
 </ol>
+{% endif %}
+{% if recipe_pages is defined and recipe_pages %}
+<h2>Recipes</h2>
+<p class="muted small">Each profession's recipe list on Wowhead holds every recipe: reagents, what it makes, skill and trainer fee. Capture these once (and again after patches) and the <a href="/crafting">Crafting</a> tab knows all Forever recipes. These pages need userscript version 2: <a href="/wowgold-capture.user.js">reinstall it</a> if no badge appears on them.</p>
+<div class="panel scroll" style="padding:0">
+<table>
+  <thead><tr><th></th><th>Profession</th><th class="num">Recipes captured</th><th></th></tr></thead>
+  <tbody>
+  {% for key, name, url, count in recipe_pages %}
+  <tr data-key="{{ key }}">
+    <td class="st"></td>
+    <td><a href="{{ url }}" target="_blank" rel="noopener">{{ name }}</a></td>
+    <td class="num">{{ count if count is not none else "" }}</td>
+    <td><button class="skip" type="button">skip</button></td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+<h2>Forever-only items</h2>
 {% endif %}
 {% if not vanilla %}<div class="note warn">No vanilla database (<code>wowgold vanilla fetch</code>), so this lists all items, not just Forever-only ones.</div>{% endif %}
 <div class="bar">
@@ -116,7 +139,7 @@ document.getElementById("open").addEventListener("click", () => {
     }, i * GAP_MS);
   });
 });
-document.querySelector("tbody").addEventListener("click", (e) => {
+document.addEventListener("click", (e) => {
   if (!e.target.classList.contains("skip")) return;
   const key = e.target.closest("tr").dataset.key;
   skipped.has(key) ? skipped.delete(key) : skipped.add(key);

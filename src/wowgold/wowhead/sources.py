@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .capture import capture_dir
+from .jsdata import array_vars, balanced, parse_js
 
 
 @dataclass(frozen=True)
@@ -113,47 +114,30 @@ def _rows_to_sources(
     return out
 
 
-def _balanced(text: str, start: int) -> str | None:
-    """The bracketed JS/JSON value starting at text[start] ('[' or '{')."""
-    open_, close = text[start], {"[": "]", "{": "}"}[text[start]]
-    depth, i, in_str, quote = 0, start, False, ""
-    while i < len(text):
-        ch = text[i]
-        if in_str:
-            if ch == "\\":
-                i += 1
-            elif ch == quote:
-                in_str = False
-        elif ch in "\"'":
-            in_str, quote = True, ch
-        elif ch == open_:
-            depth += 1
-        elif ch == close:
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-        i += 1
-    return None
-
-
 def parse_raw_listviews(script: str) -> list[tuple[str, str | None, list]]:
-    """(id, template, data) for each `new Listview({...})` whose data is valid JSON."""
+    """(id, template, data) for each `new Listview({...})` in a page script. Data can be
+    inline or a variable assigned earlier (`var listviewspells = [...]`), and may be
+    JavaScript rather than strict JSON."""
     out = []
+    variables: dict[str, list] | None = None
     for m in re.finditer(r"new Listview\(\s*\{", script):
-        body = _balanced(script, m.end() - 1)
+        body = balanced(script, m.end() - 1)
         if not body:
             continue
         tab = re.search(r"""\bid\s*:\s*['"]([\w-]+)['"]""", body)
         tmpl = re.search(r"""\btemplate\s*:\s*['"]([\w-]+)['"]""", body)
-        data = re.search(r"\bdata\s*:\s*\[", body)
+        data = re.search(r"\bdata\s*:\s*(\[|[A-Za-z_$][\w$]*)", body)
         if not (tab and data):
             continue
-        arr = _balanced(body, data.end() - 1)
-        try:
-            rows = json.loads(arr) if arr else None
-        except json.JSONDecodeError:
-            continue
-        out.append((tab[1], tmpl[1] if tmpl else None, rows))
+        if data[1] == "[":
+            arr = balanced(body, data.start(1))
+            rows = parse_js(arr) if arr else None
+        else:
+            if variables is None:
+                variables = array_vars(script)
+            rows = variables.get(data[1])
+        if isinstance(rows, list):
+            out.append((tab[1], tmpl[1] if tmpl else None, rows))
     return out
 
 

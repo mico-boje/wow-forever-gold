@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Houses · wowgold{% endblock %}
+{% block head %}
+<style>
+  .steps { color: var(--muted); max-width: 760px; padding-left: 20px; }
+  .find { display: grid; grid-template-columns: 2fr 1fr auto; gap: 10px; align-items: end;
+          max-width: 640px; }
+  @media (max-width: 600px) { .find { grid-template-columns: 1fr; } }
+  tr.mine td { background: var(--chip); }
+  form.inline { display: inline; }
+  .chip.ok { color: var(--ok); }
+</style>
+{% endblock %}
+{% block main %}
+<h1>Auction houses</h1>
+<p class="muted">Every ruleset (Normal, PvP, Roleplay, Roleplay PvP) has its own Alliance, Horde and Blackwater auction house, and they don't share listings or gold. The API lists all of them without saying which ruleset is which, so tell wowgold which one is yours.</p>
+
+{% if saved %}<div class="note ok">House {{ saved }} saved as yours. Farms and Crafting now use it.</div>{% endif %}
+{% if configured %}<div class="note warn small"><code>WOWGOLD_HOUSES={{ configured }}</code> is set in <code>.env</code> and takes precedence over the house chosen here.</div>{% endif %}
+
+<h2>Find your house</h2>
+<ol class="steps">
+  <li>In game, list any cheap item at an unusual price, for example 1 Linen Cloth for <strong>12g 34s 56c</strong> (you can cancel it later; the deposit is tiny).</li>
+  <li>Wait for the next snapshot (hourly; or run <code>wowgold collect --once</code>).</li>
+  <li>Search for that exact listing: only your house has it.</li>
+</ol>
+<form class="panel find" method="get" action="/houses">
+  <div><label for="item">Item (name or ID)</label><input id="item" name="item" value="{{ item }}" placeholder="Linen Cloth" required></div>
+  <div><label for="price">Exact price</label><input id="price" name="price" value="{{ price }}" placeholder="12g34s56c" required></div>
+  <div><button class="primary" type="submit">Search</button></div>
+</form>
+{% if error %}<div class="note bad">{{ error }}</div>{% endif %}
+{% if matches is not none %}
+  {% if matches %}
+  <div class="panel" style="margin-top:12px">
+    {% for m in matches %}
+    <div>House <strong>{{ m.house_id }}</strong> ({{ m.faction or "?" }}, {{ m.kind }}): {{ m.quantity }} × {{ item_name }} at {{ copper | gold }}
+      <span class="small muted">· snapshot {{ m.fetched_at }}</span>
+      <form class="inline" method="post" action="/houses/mine"><input type="hidden" name="house_id" value="{{ m.house_id }}">
+        <button type="submit" class="primary" style="margin-left:8px">This is mine</button></form></div>
+    {% endfor %}
+    {% if matches | length > 1 %}<p class="small muted">More than one house has that exact listing: pick a more unusual price and search again.</p>{% endif %}
+  </div>
+  {% else %}
+  <div class="note warn">No house has {{ item_name }} listed at {{ copper | gold }} in its latest snapshot. Snapshots are hourly; try again after the next one.</div>
+  {% endif %}
+{% endif %}
+
+<h2>All houses</h2>
+<div class="panel scroll" style="padding:0">
+<table>
+  <thead><tr><th>House</th><th>Faction</th><th class="num">Auctions</th><th class="num">Commodities</th><th class="num">Cut</th><th></th></tr></thead>
+  <tbody>
+  {% for h in houses %}
+  <tr class="{{ 'mine' if h.mine }}">
+    <td><strong>{{ h.house_id }}</strong></td>
+    <td>{{ (h.faction or "?") | capitalize }}</td>
+    <td class="num">{{ "{:,}".format(h.last_auctions or 0) }}</td>
+    <td class="num">{{ "{:,}".format(h.last_commodities or 0) }}</td>
+    <td class="num">{{ (h.cut * 100) | round | int }}%</td>
+    <td>{% if h.mine %}<span class="chip ok">yours</span>
+      {% elif h.faction and (h.last_auctions or h.last_commodities) %}
+      <form class="inline" method="post" action="/houses/mine"><input type="hidden" name="house_id" value="{{ h.house_id }}"><button type="submit" class="skip" style="font-size:12px;padding:2px 8px">This is mine</button></form>{% endif %}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+<p class="small muted">Cut on sales: 5% at faction houses, 15% at neutral (Blackwater) houses. Those are Classic's rules; Blizzard hasn't published Forever's. One house per faction can be yours; Blackwater is only used if you pick it on the Farms or Crafting page.</p>
+{% endblock %}

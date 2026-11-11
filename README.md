@@ -27,6 +27,7 @@ A local web app (127.0.0.1 only) with three pages:
 - **Crafting:** crafts that make money buying the materials, and what to craft from your own
   materials (see [Crafting](#crafting)).
 - **Capture:** the Wowhead to-do list and the userscript endpoint (see below).
+- **Houses:** find and save the auction house you trade on (see below).
 - **Status:** when the collector last ran, failures in the last 24 hours, and the log tail.
 
 The CLI stays the tool for cron and scripting; both use the same code. On WSL, open the address
@@ -47,6 +48,8 @@ in your Windows browser (WSL forwards localhost).
 | `wowgold session start/stop/log/import` | Record real farming sessions to calibrate yields (see below). |
 | `wowgold methods show herb_felwood` | Estimated vs measured vs calibrated yields for a method. |
 | `wowgold methods list` / `methods check` | Show curated methods; verify their item IDs against Blizzard's item data. |
+| `wowgold houses find "Linen Cloth" 12g34s56c` | Find your house: search every house for an exact listing you posted in game. |
+| `wowgold houses mine 113` | Save (or show) the house you trade on, per faction. |
 | `wowgold houses list` | Houses with faction and listing counts. `houses set-faction` to override. |
 | `wowgold vanilla fetch` | Download the VMaNGOS vanilla world database (loot tables, spawns) used by `discover`. |
 | `wowgold discover` | Generate farm hypotheses (mob camps, gathering loops) from vanilla data at current prices. |
@@ -72,6 +75,31 @@ cron with [scripts/collect-cron.sh](scripts/collect-cron.sh), which runs one cyc
 ```
 
 Install it with `crontab -e`. On WSL, cron only runs while the WSL VM is up.
+
+### Which auction house is yours
+
+Every ruleset (Normal, PvP, Roleplay, Roleplay PvP) has its own Alliance, Horde and Blackwater
+auction house, with separate listings and gold. The API lists all 15 houses under every ruleset,
+so it can't say which is which. Until you tell it, wowgold uses the busiest house of your
+faction, which may be another ruleset's market, and the Farms and Crafting pages say so.
+
+To confirm: list any cheap item in game at an unusual price (e.g. 1 Linen Cloth for 12g 34s
+56c), wait for the next hourly snapshot, then search for it on the **Houses** page or with
+`wowgold houses find "Linen Cloth" 12g34s56c`. Only your house has that listing; save it with
+*This is mine* / `wowgold houses mine <id>`. `WOWGOLD_HOUSES` in `.env` still overrides it.
+
+### Auction house rules used
+
+- **Cut:** 5% at faction houses, 15% at Blackwater (neutral) houses. These are Classic's rules;
+  Blizzard hasn't published Forever's.
+- **Prices** are per unit; buyers take the cheapest units first, across sellers (as in
+  Forever's AH window). "Market" is the average of the cheapest quarter of listings.
+- **Forever vendors:** items with a gold-only, unlimited vendor offer in your Wowhead captures
+  (e.g. the Black Market vendor Mister Graphed's reagents) are capped at that price, and
+  Crafting buys them there when it's cheaper than the AH.
+- **Not modelled:** deposits (refunded on a sale, lost when an auction expires or is
+  cancelled), and cancelled auctions count as sales in the sell-rate estimate, so sell rates of
+  heavily undercut items run somewhat high.
 
 ## Planning
 
@@ -193,6 +221,12 @@ there's no respawn data. Treat it as "worth a look", then measure it. `--leads N
 to show; a `--levels` sweep shows the best lead per level.
 
 ## Crafting
+
+**Getting every Forever recipe.** The Capture page has a *Recipes* checklist: Wowhead's
+list page for each profession (Alchemy, Blacksmithing, ... Cooking, First Aid) holds all its
+recipes with reagents, output, skill and trainer fee. Open those 9 pages with the userscript
+(version 2, which also matches `/forever/spells/...` pages) and the Crafting tab knows every
+recipe Wowhead lists. Revisit them after patches.
 
 Recipes come from the vanilla database (about 1,130 item-creating profession spells, with
 reagents, cooldowns, and how each is learned: trainer and fee, recipe item, or known from the

@@ -189,3 +189,52 @@ def test_farms_craft_option(env):
     page = client.get(f"/farms?{FARM}&craft=on").text
     assert 'name="craft" checked' in page
     assert "craft=on" in page  # kept in links (YAML download, verify)
+
+
+def test_capture_page_lists_profession_pages(env):
+    client, data_dir = env
+    page = client.get("/capture").text
+    assert "forever/spells/professions/alchemy" in page
+    assert 'data-key="spells-secondary-skills-cooking"' in page
+    row = {
+        "id": 1,
+        "name": "X",
+        "creates": [2, 1, 1],
+        "reagents": [[3, 1]],
+        "skill": [171],
+        "learnedat": 1,
+    }
+    resp = client.post(
+        "/capture",
+        json={
+            "token": get_token(data_dir),
+            "url": "https://www.wowhead.com/forever/spells/professions/alchemy",
+            "listviews": {"spells": {"data": [row]}},
+        },
+    )
+    assert resp.json() == {"saved": "spells-professions-alchemy"}
+    assert "spells-professions-alchemy" in client.get("/capture/status").json()
+    assert '<td class="num">1</td>' in client.get("/capture").text
+
+
+def test_outdated_userscript_warning(env):
+    from wowgold.wowhead.capture import USERSCRIPT_VERSION
+
+    client, data_dir = env
+    assert "userscript is outdated" not in client.get("/capture").text  # nothing captured yet
+    item = {"token": get_token(data_dir), "url": "https://www.wowhead.com/forever/item=1"}
+    client.post("/capture", json=item)  # version 1 didn't send a version
+    assert "Your userscript is outdated" in client.get("/capture").text
+    client.post("/capture", json={**item, "version": USERSCRIPT_VERSION})
+    assert "userscript is outdated" not in client.get("/capture").text
+    assert f"version: {USERSCRIPT_VERSION}," in client.get("/wowgold-capture.user.js").text
+
+
+def test_last_capture_falls_back_to_newest_file(tmp_path):
+    import json as _json
+
+    from wowgold.wowhead.capture import capture_dir, last_capture
+
+    capture_dir(tmp_path).mkdir(parents=True)
+    (capture_dir(tmp_path) / "item-1.json").write_text(_json.dumps({"captured_at": "x"}))
+    assert last_capture(tmp_path) == {"key": "item-1", "version": 1, "at": "x"}

@@ -1,0 +1,5 @@
+{# Which house the numbers come from, and a nudge when it's only a guess. Needs `r` with
+   house_ids, house_source and book. #}
+{% if r.house_source == "guess" %}
+<div class="note warn small"><strong>House {{ r.house_ids | join(", ") }} is a guess</strong>: it's the busiest house of your faction, but every ruleset (Normal, PvP, Roleplay...) has its own auction house. <a href="/houses">Confirm yours</a> so these prices are your market's.</div>
+{% endif %}

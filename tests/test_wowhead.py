@@ -168,3 +168,42 @@ def test_npc_page_becomes_its_loot_table(tmp_path):
 
     save_capture(tmp_path, {"url": "https://www.wowhead.com/forever/npc=6559", **record})
     assert {s.source_id for s in load_sources(tmp_path)} == {6559}
+
+
+def test_spell_list_pages_are_captured(tmp_path):
+    from wowgold.wowhead.capture import page_key
+
+    base = "https://www.wowhead.com/forever/spells"
+    assert page_key(f"{base}/professions/alchemy") == "spells-professions-alchemy"
+    assert page_key(f"{base}/professions/alchemy/#0+1") == "spells-professions-alchemy"
+    assert (
+        page_key(f"{base}/secondary-skills/first-aid?filter=1")
+        == "spells-secondary-skills-first-aid"
+    )
+    assert page_key("https://www.wowhead.com/forever/item=5") == "item-5"
+    assert page_key("https://www.wowhead.com/classic/spells/professions/alchemy") is None
+    script = userscript(8765, "t")
+    assert "@match        https://www.wowhead.com/forever/spells/*" in script
+    assert "@updateURL    http://127.0.0.1:8765/wowgold-capture.user.js" in script
+    assert save_capture(tmp_path, {"url": f"{base}/professions/alchemy"}) == (
+        "spells-professions-alchemy"
+    )
+
+
+def test_js_style_listview_data():
+    from wowgold.wowhead.jsdata import js_to_json, parse_js
+
+    assert parse_js("[{a:1,'b':'it\\'s',\"c\":undefined,d:[1,2,],}]") == [
+        {"a": 1, "b": "it's", "c": None, "d": [1, 2]}
+    ]
+    # keys inside strings stay untouched
+    assert parse_js('[{"t":"a, b: c", n:1e3}]') == [{"t": "a, b: c", "n": 1000.0}]
+    assert js_to_json('{x:"say \\"hi\\""}') == '{"x":"say \\"hi\\""}'
+
+    script = (
+        'var listviewspells = [{"id":1,"creates":[2,1,1],quality:-1,popularity:207}];\n'
+        "new Listview({template: 'spell', id: 'spells', note: \"a:b\", data: listviewspells});"
+    )
+    ((tab, template, rows),) = parse_raw_listviews(script)
+    assert (tab, template) == ("spells", "spell")
+    assert rows == [{"id": 1, "creates": [2, 1, 1], "quality": -1, "popularity": 207}]

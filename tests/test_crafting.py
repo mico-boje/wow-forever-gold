@@ -155,3 +155,43 @@ def test_wowhead_recipe_rows(tmp_path, world):
 
     merged = merge_recipes(load_vanilla_recipes(world), forever)
     assert set(merged) == {DRAUGHT_SPELL, TRANSMUTE_SPELL, 1249632}
+
+
+def test_recipes_from_profession_list_page(tmp_path):
+    from wowgold.crafting.recipes import recipe_counts
+    from wowgold.wowhead.capture import save_capture
+
+    rows = [
+        WOWHEAD_ROW,
+        {**WOWHEAD_ROW, "id": 7, "name": "Elixir", "creates": [5, 2, 4], "source": [5]},
+        {"id": 8, "name": "Not a craft", "skill": [171]},
+    ]
+    save_capture(
+        tmp_path,
+        {
+            "url": "https://www.wowhead.com/forever/spells/professions/alchemy",
+            "listviews": {"spells": {"template": {"entityType": 6}, "data": rows}},
+        },
+    )
+    # an item page that teaches the same recipe adds the recipe item as a way to learn it
+    (tmp_path / "wowhead" / "captures" / "item-900.json").write_text(
+        json.dumps({"listviews": {"teaches-recipe": {"data": [WOWHEAD_ROW]}}})
+    )
+    recipes = load_wowhead_recipes(tmp_path)
+    assert set(recipes) == {1249632, 7}
+    assert recipes[7].output_qty == 3.0
+    assert {(ls.kind, ls.item_id) for ls in recipes[1249632].learn} == {
+        ("trainer", None),
+        ("recipe", 900),
+    }
+    assert recipe_counts(tmp_path) == {"spells-professions-alchemy": 2}
+
+
+def test_merge_keeps_vanilla_cooldown_and_learn_details(world):
+    vanilla = load_vanilla_recipes(world)
+    row = {**WOWHEAD_ROW, "id": TRANSMUTE_SPELL, "name": "Bone Elixir", "source": [2]}
+    forever = {TRANSMUTE_SPELL: recipe_from_wowhead_row(row)}
+    merged = merge_recipes(vanilla, forever)[TRANSMUTE_SPELL]
+    assert merged.source == "wowhead" and merged.skill == 215  # Forever data wins
+    assert merged.cooldown_s == 2 * 86400  # but keeps vanilla's cooldown
+    assert [(ls.kind, ls.item_id) for ls in merged.learn] == [("recipe", RECIPE_ITEM)]

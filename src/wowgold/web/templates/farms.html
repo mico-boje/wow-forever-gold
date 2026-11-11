@@ -241,12 +241,13 @@
       <p class="muted small">
         {{ p.faction | capitalize }} {{ p.cls }} ·
         {% for k, v in p.professions.items() %}{{ k }} {{ v }}{{ ", " if not loop.last }}{% else %}no professions{% endfor %}
-        · house {{ res.house_ids | join(", ") }}
+        · house {{ res.house_ids | join(", ") }}{{ " (yours)" if res.house_source == "confirmed" }}, {{ (res.book.cut * 100) | round | int }}% cut
         {% if res.placed or res.unplaced %} · {{ res.placed | length }} Wowhead source(s) in camps, {{ res.unplaced | length }} as leads{% endif %}
         · <a href="/farms/hypotheses.yaml?{{ form.query() }}">download as YAML</a>
       </p>
       <p><a class="btn" href="/capture?{{ form.query() }}">Verify these farms on Wowhead</a>
         <span class="small muted">Capture the mobs' and nodes' Forever loot tables; verified farms are re-scored with them.</span></p>
+      {% with r = res %}{% include "_house_note.html" %}{% endwith %}
       <div class="note warn small">Hypotheses from vanilla 1.12 data: drop rates, spawns and respawns may differ in Forever, and kill and gather rates are rough guesses. Test them in game, then record sessions.
         {% if res.sales_coverage_h < 12 %}Demand is estimated from listings until the collector has {{ "%.0f" | format(12 - res.sales_coverage_h) }} more hours of history.{% endif %}</div>
 

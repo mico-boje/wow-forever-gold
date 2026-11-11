@@ -28,17 +28,38 @@ from fastapi.templating import Jinja2Templates
 from .. import db
 from ..config import Settings, get_settings
 from ..crafting.profit import CraftOptions
+from ..crafting.recipes import recipe_counts
 from ..discovery.discover import CLASS_KILL_SPEED, parse_levels, to_yaml_entries
 from ..discovery.service import VanillaCache, run_crafting, run_discover
+from ..market.myhouse import find_listing, load_my_houses, set_my_house
+from ..market.query import find_items
 from ..methods.models import PROFESSIONS, GearTier
 from ..planner.engine import PlanOptions
+from ..planner.pricing import ah_cut
 from ..planner.profile import CharacterProfile
-from ..sessions import load_profile, save_profile
-from ..wowhead.capture import MAX_BODY, captured, get_token, pick_targets, save_capture, userscript
+from ..sessions import load_profile, parse_coins, save_profile
+from ..wowhead.capture import (
+    MAX_BODY,
+    PROFESSION_PAGES,
+    USERSCRIPT_VERSION,
+    captured,
+    get_token,
+    last_capture,
+    page_key,
+    pick_targets,
+    save_capture,
+    script_version,
+    userscript,
+)
 
 TEMPLATES = Path(__file__).parent / "templates"
 CLASSES = sorted(CLASS_KILL_SPEED)
 KINDS = ("all", "farm", "gather")
+
+
+def log(msg: str) -> None:
+    """One line in the terminal running `wowgold ui`."""
+    print(f"{datetime.now():%H:%M:%S} {msg}", flush=True)
 
 
 def gold(copper: float | None) -> str:
@@ -484,10 +505,20 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
                 if not saved or r["faction"] == saved.faction
             ]
             targets = pick_targets(conn, s.wowgold_region, houses, exclude, limit=40)
+        counts = recipe_counts(s.wowgold_data_dir)
+        recipe_pages = [
+            (key, name, url, counts.get(key))
+            for name, url in PROFESSION_PAGES
+            if (key := page_key(url))
+        ]
+        last = last_capture(s.wowgold_data_dir)
         return render(
             request,
             "capture.html",
             targets=targets,
+            recipe_pages=recipe_pages,
+            last=last,
+            script_version=USERSCRIPT_VERSION,
             vanilla=bool(exclude),
             done=captured(s.wowgold_data_dir),
         )
@@ -534,18 +565,82 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
     async def capture_post(request: Request) -> Response:
         body = await request.body()
         if not 0 < len(body) <= MAX_BODY:
+            log(f"capture refused: {len(body):,} bytes")
             return PlainTextResponse("bad size", status_code=413)
         try:
             payload = json.loads(body)
         except json.JSONDecodeError:
             return PlainTextResponse("bad json", status_code=400)
         if not secrets.compare_digest(str(payload.get("token", "")), token):
+            log(f"capture refused: wrong token from {payload.get('url', '?')}")
             return PlainTextResponse("bad token", status_code=403)
         try:
             key = save_capture(s.wowgold_data_dir, payload)
         except ValueError as exc:
+            log(f"capture refused: {exc} ({payload.get('url', '?')})")
             return PlainTextResponse(str(exc), status_code=400)
+        version = script_version(payload)
+        old = " — outdated userscript, reinstall it" if version < USERSCRIPT_VERSION else ""
+        log(f"captured {key} (userscript v{version}){old}")
         return JSONResponse({"saved": key})
+
+    # -- houses ------------------------------------------------------------------------------
+
+    @app.get("/houses", response_class=HTMLResponse)
+    def houses_page(request: Request) -> HTMLResponse:
+        q = request.query_params
+        item_q, price_q = (q.get("item") or "").strip(), (q.get("price") or "").strip()
+        matches, error, item_name, copper = None, None, None, None
+        with connect() as conn:
+            houses = [dict(r) for r in db.list_houses(conn, s.wowgold_region)]
+            if item_q and price_q:
+                try:
+                    copper = parse_coins(price_q)
+                    found = find_items(conn, item_q, limit=1)
+                    if not found:
+                        error = f"No item called {item_q!r} in the item list."
+                    else:
+                        item_name = found[0].name or item_q
+                        matches = find_listing(conn, s.wowgold_region, found[0].item_id, copper)
+                except ValueError as exc:
+                    error = str(exc)
+        mine = load_my_houses(s.wowgold_data_dir, s.wowgold_region)
+        for h in houses:
+            h["cut"] = ah_cut(h["faction"])
+            h["mine"] = mine.get(h["faction"]) == h["house_id"]
+        return render(
+            request,
+            "houses.html",
+            houses=houses,
+            mine=mine,
+            configured=s.wowgold_houses,
+            item=item_q,
+            price=price_q,
+            item_name=item_name,
+            copper=copper,
+            matches=matches,
+            error=error,
+            saved=q.get("saved"),
+        )
+
+    @app.post("/houses/mine")
+    async def houses_mine(request: Request) -> Response:
+        if not same_origin(request):
+            return PlainTextResponse("cross-site request refused", status_code=403)
+        form = await request.form()
+        try:
+            house_id = int(form.get("house_id") or "")
+        except ValueError:
+            return PlainTextResponse("bad house", status_code=400)
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT faction FROM houses WHERE region = ? AND house_id = ?",
+                (s.wowgold_region, house_id),
+            ).fetchone()
+        if row is None or not row[0]:
+            return PlainTextResponse("unknown house", status_code=400)
+        set_my_house(s.wowgold_data_dir, s.wowgold_region, row[0], house_id)
+        return RedirectResponse(f"/houses?saved={house_id}", status_code=303)
 
     # -- status ------------------------------------------------------------------------------
 

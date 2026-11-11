@@ -95,8 +95,10 @@
       <p class="muted">Enter your crafting skills and faction, then <strong>Find crafts</strong>. You'll get recipes that make money when you buy the materials on the auction house (or from vendors), and the best way to turn materials you farm yourself into something worth more. Your saved profile fills this in automatically.</p>
     {% else %}
       <h1>Crafts that make money</h1>
-      <p class="muted small">{{ res.recipes_total }} recipes ({{ res.recipes_forever }} Forever recipes from your <a href="/capture">Wowhead captures</a>) · house {{ res.house_ids | join(", ") }}</p>
-      <div class="note warn small">Buying at today's average AH price and selling after the 5% cut. Per day is capped by how fast the output sells (your {{ (form.share * 100) | round | int }}% share), how many materials are listed right now, and cooldowns.
+      <p class="muted small">{{ res.recipes_total }} recipes ({{ res.recipes_forever }} Forever recipes from your <a href="/capture">Wowhead captures</a>) · house {{ res.house_ids | join(", ") }}{{ " (yours)" if res.house_source == "confirmed" }}
+        {%- if res.capped %} · {{ res.capped | length }} item(s) capped at a Forever vendor's price{% endif %}</p>
+      {% with r = res %}{% include "_house_note.html" %}{% endwith %}
+      <div class="note warn small">Buying at today's average AH price and selling after the {{ (res.book.cut * 100) | round | int }}% cut. Per day is capped by how fast the output sells (your {{ (form.share * 100) | round | int }}% share), how many materials are listed right now, and cooldowns.
         {% if res.sales_coverage_h < 12 %} Sales are estimated from listings until the collector has 12 hours of history.{% endif %}</div>
 
       <div class="crafts">

@@ -269,6 +269,77 @@ def houses_set_faction(
     console.print(f"House {house_id} → {faction}")
 
 
+@houses_app.command("find")
+def houses_find(
+    item: Annotated[str, typer.Argument(help="Item name or ID you listed.")],
+    price: Annotated[str, typer.Argument(help="Exact price you listed it at, e.g. 12g34s56c.")],
+    region: RegionOpt = None,
+) -> None:
+    """Find which house is yours: list an item in game at an unusual price, wait for the next
+    snapshot (or run `wowgold collect --once`), then search for that exact listing."""
+    from .market.myhouse import find_listing
+
+    s = get_settings()
+    region = region or s.wowgold_region
+    try:
+        copper = parse_coins(price)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    conn = db.connect(s.db_path)
+    try:
+        matches = find_items(conn, item, limit=1)
+        if not matches:
+            raise typer.BadParameter(f"no item called {item!r}")
+        found = find_listing(conn, region, matches[0].item_id, copper)
+    finally:
+        conn.close()
+    name = matches[0].name or item
+    if not found:
+        console.print(
+            f"No house has {name} listed at {format_money(copper)} in its latest snapshot. "
+            "Snapshots are hourly: wait for the next one or run `wowgold collect --once`."
+        )
+        raise typer.Exit(1)
+    for m in found:
+        console.print(
+            f"House [bold]{m.house_id}[/] ({m.faction or '?'}, {m.kind}): {m.quantity} × {name} "
+            f"at {format_money(copper)} · snapshot {m.fetched_at}"
+        )
+    if len(found) == 1:
+        console.print(
+            f"Save it with `wowgold houses mine {found[0].house_id}` (or on the Status page)."
+        )
+
+
+@houses_app.command("mine")
+def houses_mine(
+    house_id: Annotated[int | None, typer.Argument(help="House ID; omit to show yours.")] = None,
+    clear: Annotated[str | None, typer.Option(help="Forget the house for this faction.")] = None,
+    region: RegionOpt = None,
+) -> None:
+    """Show or set the house you trade on (one per faction)."""
+    from .market.myhouse import load_my_houses, set_my_house
+
+    s = get_settings()
+    region = region or s.wowgold_region
+    if clear:
+        set_my_house(s.wowgold_data_dir, region, clear.lower(), None)
+    elif house_id is not None:
+        conn = db.connect(s.db_path)
+        row = conn.execute(
+            "SELECT faction FROM houses WHERE region = ? AND house_id = ?", (region, house_id)
+        ).fetchone()
+        conn.close()
+        if row is None or not row[0]:
+            raise typer.BadParameter(f"house {house_id} unknown or without a faction")
+        set_my_house(s.wowgold_data_dir, region, row[0], house_id)
+    mine = load_my_houses(s.wowgold_data_dir, region)
+    if not mine:
+        console.print("No house confirmed yet. Find yours with `wowgold houses find`.")
+    for faction, hid in sorted(mine.items()):
+        console.print(f"{faction}: house {hid}")
+
+
 OVERRIDES_FILE = "item_overrides.csv"
 
 
@@ -479,7 +550,16 @@ def _gold(copper: float | None) -> str:
 
 
 def _pick_houses(conn, region: str, faction: str, explicit: list[int] | None, s: Settings):
-    return pick_houses(conn, region, faction, explicit, s.wowgold_houses)
+    from .market.myhouse import load_my_houses
+
+    return pick_houses(
+        conn,
+        region,
+        faction,
+        explicit,
+        s.wowgold_houses,
+        load_my_houses(s.wowgold_data_dir, region),
+    )
 
 
 @app.command()

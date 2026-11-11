@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..wowhead.capture import capture_dir
+from ..wowhead.sources import parse_raw_listviews
 
 # skill line id -> profession name as used in profiles
 SKILLS = {
@@ -203,39 +204,89 @@ def recipe_from_wowhead_row(row: dict, recipe_item: int | None = None) -> Recipe
     )
 
 
+def _recipes_in_capture(record: dict, key: str) -> list[Recipe]:
+    """Recipes on one captured page. Item pages: only the recipe tabs ("Created by", "Reagent
+    for", "Teaches"). Spell list pages (/spells/professions/...): every table."""
+    out = []
+    page_item = int(key.split("-", 1)[1]) if key.startswith("item-") else None
+    tables: list[tuple[str, list]] = []
+    for tab, lv in (record.get("listviews") or {}).items():
+        if isinstance(lv, dict) and lv.get("data"):
+            tables.append((tab, lv["data"]))
+    seen = {tab for tab, _ in tables}
+    # Big lists (whole professions) don't survive the userscript's copy; the raw page script
+    # has them.
+    for script in record.get("raw") or []:
+        for tab, _template, rows in parse_raw_listviews(script):
+            if tab not in seen:
+                seen.add(tab)
+                tables.append((tab, rows))
+    for tab, rows in tables:
+        if page_item is not None and tab not in RECIPE_TABS:
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            recipe = recipe_from_wowhead_row(row, page_item if tab == "teaches-recipe" else None)
+            if recipe is not None:
+                out.append(recipe)
+    return out
+
+
 def load_wowhead_recipes(data_dir: Path) -> dict[int, Recipe]:
     out: dict[int, Recipe] = {}
-    for path in sorted(capture_dir(data_dir).glob("item-*.json")):
+    paths = sorted(capture_dir(data_dir).glob("spells-*.json"))
+    paths += sorted(capture_dir(data_dir).glob("item-*.json"))  # item pages add recipe items
+    for path in paths:
         try:
             record = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        page_item = int(path.stem.split("-", 1)[1])
-        for tab, lv in (record.get("listviews") or {}).items():
-            if tab not in RECIPE_TABS or not isinstance(lv, dict):
-                continue
-            for row in lv.get("data") or []:
-                if not isinstance(row, dict):
-                    continue
-                recipe = recipe_from_wowhead_row(
-                    row, page_item if tab == "teaches-recipe" else None
-                )
-                if recipe is None:
-                    continue
-                prev = out.get(recipe.spell_id)
-                if prev and not any(ls.kind == "recipe" for ls in recipe.learn):
-                    # keep the recipe-item link learned from a "teaches" tab
-                    recipe.learn += [ls for ls in prev.learn if ls.kind == "recipe"]
-                out[recipe.spell_id] = recipe
+        for recipe in _recipes_in_capture(record, path.stem):
+            prev = out.get(recipe.spell_id)
+            if prev:
+                # keep what the other page knew: recipe-item links, trainer fees
+                known = {(ls.kind, ls.item_id) for ls in recipe.learn}
+                recipe.learn += [
+                    ls
+                    for ls in prev.learn
+                    if ls.kind != "unknown" and (ls.kind, ls.item_id) not in known
+                ]
+                recipe.learn = [ls for ls in recipe.learn if ls.kind != "unknown"] or [
+                    LearnSource("unknown")
+                ]
+            out[recipe.spell_id] = recipe
     return out
 
 
+def recipe_counts(data_dir: Path) -> dict[str, int]:
+    """Capture key -> number of recipes found on it, for spell list pages."""
+    counts = {}
+    for path in sorted(capture_dir(data_dir).glob("spells-*.json")):
+        try:
+            counts[path.stem] = len(_recipes_in_capture(json.loads(path.read_text()), path.stem))
+        except (OSError, json.JSONDecodeError):
+            counts[path.stem] = 0
+    return counts
+
+
+DETAILED_LEARN = ("trainer", "recipe", "starter")
+
+
 def merge_recipes(vanilla: dict[int, Recipe], forever: dict[int, Recipe]) -> dict[int, Recipe]:
-    """Wowhead (Forever) data wins for the same spell; its learn sources are added to vanilla's
-    when Wowhead doesn't say how it's learned."""
+    """Wowhead (Forever) data wins for reagents, output and skill. Vanilla fills in what
+    Wowhead's lists don't carry: cooldowns, and learn details (recipe items with their vendor
+    price, trainer fees) when Wowhead only says "drop" or "vendor"."""
     out = dict(vanilla)
     for sid, r in forever.items():
-        if sid in out and all(ls.kind == "unknown" for ls in r.learn):
-            r.learn = out[sid].learn
+        old = out.get(sid)
+        if old is not None:
+            r.cooldown_s = max(r.cooldown_s, old.cooldown_s)
+            detailed = [ls for ls in r.learn if ls.kind in DETAILED_LEARN]
+            if not detailed:
+                r.learn = old.learn
+            else:
+                kinds = {ls.kind for ls in detailed}
+                r.learn = detailed + [ls for ls in old.learn if ls.kind not in kinds]
         out[sid] = r
     return out

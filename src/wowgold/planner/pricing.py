@@ -4,10 +4,19 @@ auction houses a plan is made for."""
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 
-AH_CUT = 0.05  # auction house fee on successful sales
+AH_CUT = 0.05  # auction house fee on successful sales at a faction house
+# Neutral (Blackwater) houses: Classic took 15%. Blizzard hasn't published Forever's rates, so
+# both are the Classic rules.
+NEUTRAL_AH_CUT = 0.15
+NEUTRAL_FACTIONS = ("blackwater", "neutral")
+
+
+def ah_cut(faction: str | None) -> float:
+    return NEUTRAL_AH_CUT if (faction or "").lower() in NEUTRAL_FACTIONS else AH_CUT
+
 
 # Without measured sales we guess daily demand as a fraction of what's listed. Crude, but
 # it scales with how big the market for an item is; replaced by real sales once the
@@ -28,10 +37,11 @@ class ItemPrice:
     sold_per_day: float | None  # measured; None = no sales data
     absorb_per_day: float  # measured or estimated units/day the market takes
     absorb_measured: bool
+    cut: float = AH_CUT  # the house's cut on sales
 
     @property
     def ah_net(self) -> int | None:
-        return round(self.market * (1 - AH_CUT)) if self.market else None
+        return round(self.market * (1 - self.cut)) if self.market else None
 
     @property
     def sell_value(self) -> int:
@@ -44,10 +54,11 @@ class PriceBook:
     house_ids: list[int]
     prices: dict[int, ItemPrice] = field(default_factory=dict)
     sales_coverage_h: float = 0.0
+    cut: float = AH_CUT  # cut on sales at these houses (the highest, if they differ)
 
     def get(self, item_id: int) -> ItemPrice:
         return self.prices.get(item_id) or ItemPrice(
-            item_id, None, None, 0, 0, None, None, 0.0, False
+            item_id, None, None, 0, 0, None, None, 0.0, False, self.cut
         )
 
 
@@ -77,6 +88,16 @@ def build_price_book(
     and the market price is the quantity-weighted average."""
     now = now or datetime.now(UTC)
     book = PriceBook(house_ids=list(house_ids))
+    if house_ids:
+        marks = ",".join("?" * len(house_ids))
+        factions = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT faction FROM houses WHERE region = ? AND house_id IN ({marks})",
+                (region, *house_ids),
+            )
+        ]
+        book.cut = max((ah_cut(f) for f in factions), default=AH_CUT)
     if not house_ids or not item_ids:
         return book
     snap_ids = _latest_snapshot_ids(conn, region, house_ids)
@@ -153,6 +174,7 @@ def build_price_book(
             sold_per_day=sold_per_day,
             absorb_per_day=absorb,
             absorb_measured=measured and sold_per_day is not None,
+            cut=book.cut,
         )
     return book
 
@@ -163,13 +185,17 @@ def pick_houses(
     faction: str,
     explicit: list[int] | None = None,
     configured: list[int] | None = None,
+    mine: dict[str, int] | None = None,
 ) -> list[int]:
-    """Houses to price with: explicit choice, else WOWGOLD_HOUSES, else the busiest house of
-    the faction."""
+    """Houses to price with: explicit choice, else WOWGOLD_HOUSES, else the house you
+    confirmed for this faction, else the busiest house of the faction (a guess: each ruleset
+    has its own)."""
     if explicit:
         return list(explicit)
     if configured:
         return list(configured)
+    if mine and mine.get(faction):
+        return [mine[faction]]
     from .. import db
 
     candidates = [
@@ -181,3 +207,15 @@ def pick_houses(
         return []
     best = max(candidates, key=lambda r: (r["last_auctions"] or 0) + (r["last_commodities"] or 0))
     return [best["house_id"]]
+
+
+def cap_prices(book: PriceBook, caps: dict[int, float]) -> list[int]:
+    """Cap AH prices at what a vendor sells the item for with unlimited stock: nobody pays
+    more on the AH. Returns the items that were capped."""
+    capped = []
+    for item_id, cap in caps.items():
+        price = book.prices.get(item_id)
+        if price is not None and price.market is not None and price.market > cap:
+            book.prices[item_id] = replace(price, market=round(cap))
+            capped.append(item_id)
+    return capped
