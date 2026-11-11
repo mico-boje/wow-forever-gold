@@ -27,8 +27,9 @@ from fastapi.templating import Jinja2Templates
 
 from .. import db
 from ..config import Settings, get_settings
+from ..crafting.profit import CraftOptions
 from ..discovery.discover import CLASS_KILL_SPEED, parse_levels, to_yaml_entries
-from ..discovery.service import VanillaCache, run_discover
+from ..discovery.service import VanillaCache, run_crafting, run_discover
 from ..methods.models import PROFESSIONS, GearTier
 from ..planner.engine import PlanOptions
 from ..planner.profile import CharacterProfile
@@ -122,6 +123,7 @@ class FarmForm:
     house: int | None = None
     top: int = 15
     leads: int = 8
+    craft: bool = False
     errors: list[str] = field(default_factory=list)
 
     @classmethod
@@ -155,6 +157,7 @@ class FarmForm:
                 f.professions[p] = min(skill, 300)
         f.kind = params.get("kind", "all") if params.get("kind") in KINDS else "all"
         f.elites = params.get("elites") == "on"
+        f.craft = params.get("craft") == "on"
         f.levels = (params.get("levels") or "").strip()
         f.step = num("step", int, 5)
         f.hours = num("hours", float, 2.0)
@@ -211,8 +214,72 @@ class FarmForm:
             q["epic_mount"] = "on"
         if self.elites:
             q["elites"] = "on"
+        if self.craft:
+            q["craft"] = "on"
         q |= {f"prof_{p}": s for p, s in self.professions.items()}
         return urlencode(q)
+
+
+CRAFT_PROFESSIONS = (
+    "alchemy",
+    "blacksmithing",
+    "enchanting",
+    "engineering",
+    "leatherworking",
+    "tailoring",
+    "cooking",
+    "first_aid",
+    "mining",
+)
+
+
+@dataclass
+class CraftForm:
+    faction: str = ""
+    professions: dict[str, int] = field(default_factory=dict)
+    only_craftable: bool = True
+    cooldowns: bool = True
+    min_sales: float = 0.0
+    sell_days: float = 3.0
+    share: float = 0.5
+    house: int | None = None
+    top: int = 50
+    errors: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_request(cls, params, saved: CharacterProfile | None) -> CraftForm:
+        f = cls()
+        if saved:
+            f.faction = saved.faction
+            f.professions = {p: v for p, v in saved.professions.items() if p in CRAFT_PROFESSIONS}
+        if not params.get("submitted"):
+            return f
+
+        def num(name, conv, default):
+            raw = (params.get(name) or "").strip()
+            if not raw:
+                return default
+            try:
+                return conv(raw)
+            except ValueError:
+                f.errors.append(f"{name}: not a number")
+                return default
+
+        f.faction = params.get("faction", f.faction)
+        f.professions = {}
+        for p in CRAFT_PROFESSIONS:
+            if (skill := num(f"prof_{p}", int, None)) is not None and skill > 0:
+                f.professions[p] = min(skill, 300)
+        f.only_craftable = params.get("only_craftable") == "on"
+        f.cooldowns = params.get("cooldowns") == "on"
+        f.min_sales = max(0.0, num("min_sales", float, 0.0))
+        f.sell_days = num("sell_days", float, 3.0)
+        f.share = num("share", float, 0.5)
+        f.house = num("house", int, None)
+        f.top = max(1, min(num("top", int, 50), 300))
+        if f.faction not in ("horde", "alliance"):
+            f.errors.append("pick a faction")
+        return f
 
 
 @dataclass
@@ -281,6 +348,7 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
                     levels=levels,
                     top=3 if levels else form.top,
                     leads=1 if levels else form.leads,
+                    craft=form.craft,
                 )
             except LookupError as exc:
                 return None, str(exc)
@@ -301,8 +369,7 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
         chart = None
         if res and res.sweep:
             best = [
-                (r.profile.level, r.farms[0].evaluation.gold_per_hour if r.farms else 0)
-                for r in res.results
+                (r.profile.level, r.farms[0].total_per_hour if r.farms else 0) for r in res.results
             ]
             top = max((v for _, v in best), default=0) or 1
             chart = [(lvl, v, v / top) for lvl, v in best]
@@ -354,6 +421,49 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
             body,
             media_type="application/x-yaml",
             headers={"Content-Disposition": 'attachment; filename="hypotheses.yaml"'},
+        )
+
+    # -- crafting ----------------------------------------------------------------------------
+
+    @app.get("/crafting", response_class=HTMLResponse)
+    def crafting(request: Request) -> HTMLResponse:
+        saved = load_profile(s.profile_path)
+        form = CraftForm.from_request(request.query_params, saved)
+        res, error = None, None
+        run = bool(request.query_params.get("submitted")) or bool(saved and form.professions)
+        if run and not form.errors and form.faction:
+            if not cache.available:
+                error = "The vanilla database is missing: run `wowgold vanilla fetch`."
+            else:
+                with connect() as conn:
+                    try:
+                        res = run_crafting(
+                            cache,
+                            conn,
+                            faction=form.faction,
+                            professions=form.professions,
+                            opts=CraftOptions(sell_days=form.sell_days, market_share=form.share),
+                            region=s.wowgold_region,
+                            house=[form.house] if form.house else None,
+                            configured_houses=s.wowgold_houses,
+                            only_craftable=form.only_craftable,
+                            min_sales=form.min_sales,
+                            cooldowns=form.cooldowns,
+                            top=form.top,
+                        )
+                    except LookupError as exc:
+                        error = str(exc)
+        with connect() as conn:
+            houses = [dict(r) for r in db.list_houses(conn, s.wowgold_region)]
+        return render(
+            request,
+            "crafting.html",
+            form=form,
+            res=res,
+            error=error,
+            houses=houses,
+            professions=CRAFT_PROFESSIONS,
+            rate=(lambda item_id: sell_rate(res.book, item_id)) if res else None,
         )
 
     # -- capture -----------------------------------------------------------------------------

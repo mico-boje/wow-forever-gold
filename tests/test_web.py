@@ -170,3 +170,22 @@ def test_farm_details_show_sell_rates(env):
     page = client.get(f"/farms?{FARM}").text
     assert '<th class="num">Sells</th>' in page
     assert "Sells = units sold per day on your auction house" in page
+
+
+def test_crafting_page(env):
+    client, _ = env
+    intro = client.get("/crafting").text
+    assert "Find crafts" in intro and 'href="/crafting" class="on"' in intro
+    q = "submitted=1&faction=horde&prof_alchemy=220&only_craftable=on&cooldowns=on&house=1"
+    page = client.get(f"/crafting?{q}").text
+    # the test AH is empty, so nothing is profitable, but the page renders with counts
+    assert "Crafts that make money" in page and "2 recipes" in page
+    assert "No profitable crafts" in page
+    assert "pick a faction" in client.get("/crafting?submitted=1&prof_alchemy=220").text
+
+
+def test_farms_craft_option(env):
+    client, _ = env
+    page = client.get(f"/farms?{FARM}&craft=on").text
+    assert 'name="craft" checked' in page
+    assert "craft=on" in page  # kept in links (YAML download, verify)

@@ -165,6 +165,13 @@ class Candidate:
     # Wowhead pages that verify this farm: ("npc" | "object", id, name), most valuable first
     pages: list[tuple[str, int, str]] = field(default_factory=list)
     verified: int = 0  # how many of `pages` have a Forever loot table captured
+    # "craft before selling": extra copper/h from crafting the yields, and how
+    craft_extra: float = 0.0
+    craft_notes: list[str] = field(default_factory=list)
+
+    @property
+    def total_per_hour(self) -> float:
+        return (self.evaluation.gold_per_hour if self.evaluation else 0.0) + self.craft_extra
 
     @property
     def verified_label(self) -> str:

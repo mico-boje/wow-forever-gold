@@ -107,15 +107,22 @@ class VItem:
     sell_price: int
     bind: int  # 1 = bind on pickup (can't be sold on the AH)
     iclass: int  # 2 weapon, 4 armor, 7 trade goods, ...
+    buy_price: int = 0  # what a vendor charges, if it sells it
 
 
 def load_items(conn: sqlite3.Connection) -> dict[int, VItem]:
     return {
         r["entry"]: VItem(
-            r["entry"], r["name"], r["quality"], r["sell_price"], r["bonding"], r["class"]
+            r["entry"],
+            r["name"],
+            r["quality"],
+            r["sell_price"],
+            r["bonding"],
+            r["class"],
+            r["buy_price"],
         )
         for r in conn.execute(
-            f"SELECT entry, name, quality, sell_price, bonding, class "
+            f"SELECT entry, name, quality, sell_price, bonding, class, buy_price "
             f"FROM {_latest('item_template')}"
         )
     }

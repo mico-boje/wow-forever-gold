@@ -87,7 +87,7 @@
         {%- elif c.verified %} <span class="chip" title="Forever loot tables captured for some of its mobs/nodes">{{ c.verified_label }} verified</span>{% endif %}
         <br><span class="muted small">{{ m.zone }}</span></span>
       <span class="needs">{{ needs(m) }}</span>
-      <span class="gph">{{ ev.gold_per_hour | gold }}</span>
+      <span class="gph">{{ c.total_per_hour | gold }}{% if c.craft_extra > 0 %}<br><span class="small muted" style="font-weight:400">+{{ c.craft_extra | gold }} crafting</span>{% endif %}</span>
       <span class="rng">{{ ev.low | gold }}–{{ ev.high | gold }}</span>
       <span class="items small">
         {%- for ln in (ev.lines | selectattr('item_id') | sort(attribute='value', reverse=True))[:3] -%}
@@ -118,6 +118,8 @@
         {% endfor %}
       </table></div>
       <p class="small muted">Sells = units sold per day on your auction house ("~" = estimated from listings). Orange: this session alone would take longer than {{ form.sell_days | round(1) }} days to sell; the excess is valued at vendor price.</p>
+      {% if c.craft_notes %}<p class="small"><strong>Craft before selling</strong> (+{{ c.craft_extra | gold }}/h):</p>
+      <ul class="small">{% for n in c.craft_notes %}<li>{{ n }}</li>{% endfor %}</ul>{% endif %}
       {% if ev.flags %}<ul class="small muted">{% for fl in ev.flags %}<li>{{ fl }}</li>{% endfor %}</ul>{% endif %}
       <div class="small muted">id <code>{{ m.id }}</code></div>
     </div>
@@ -185,6 +187,7 @@
     <div class="field">
       <label class="check"><input type="checkbox" name="epic_mount" {{ 'checked' if form.epic_mount }}>Epic mount</label>
       <label class="check"><input type="checkbox" name="elites" {{ 'checked' if form.elites }}>Include elites</label>
+      <label class="check" title="Value yields as the best craft your professions can make from them (see the Crafting tab)"><input type="checkbox" name="craft" {{ 'checked' if form.craft }}>Craft before selling</label>
     </div>
     <div class="row2 field">
       <div><label for="kind">Look for</label>

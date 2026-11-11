@@ -1598,3 +1598,112 @@ def capture_sources() -> None:
             "camp" if used else "[dim]lead (no open-world spawns)[/]",
         )
     console.print(table)
+
+
+@app.command()
+def crafts(
+    faction: FactionOpt = None,
+    prof: ProfOpt = None,
+    everything: Annotated[
+        bool, typer.Option("--all", help="Include recipes your skill can't make yet.")
+    ] = False,
+    min_sales: Annotated[
+        float, typer.Option(help="Only outputs selling at least this many per day.")
+    ] = 0.0,
+    cooldowns: Annotated[bool, typer.Option(help="Include cooldown crafts.")] = True,
+    sell_days: Annotated[float, typer.Option(help="Days you're willing to wait to sell.")] = 3.0,
+    share: Annotated[
+        float, typer.Option(help="Share of daily demand you expect to capture (0-1).")
+    ] = 0.5,
+    house: Annotated[list[int] | None, typer.Option("--house", "-h", help="House ID(s).")] = None,
+    top: Annotated[int, typer.Option(help="How many crafts to list.")] = 20,
+    region: RegionOpt = None,
+) -> None:
+    """Crafts that make money buying the materials, and what to craft from your own mats.
+
+    Vanilla recipes plus Forever recipes from your Wowhead captures. Profession skills and
+    faction default to your saved profile."""
+    from .crafting.profit import CraftOptions
+    from .discovery.service import VanillaCache, run_crafting
+
+    s = get_settings()
+    region = region or s.wowgold_region
+    saved = load_profile(s.profile_path)
+    fac = (faction or (saved.faction if saved else "")).lower()
+    try:
+        profs = parse_professions(prof) if prof else dict(saved.professions if saved else {})
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if fac not in ("horde", "alliance"):
+        raise typer.BadParameter("pass --faction or save a profile")
+    conn = db.connect(s.db_path)
+    try:
+        with console.status("Pricing recipes..."):
+            res = run_crafting(
+                VanillaCache(s.wowgold_data_dir),
+                conn,
+                faction=fac,
+                professions=profs,
+                opts=CraftOptions(sell_days=sell_days, market_share=share),
+                region=region,
+                house=house,
+                configured_houses=s.wowgold_houses,
+                only_craftable=not everything,
+                min_sales=min_sales,
+                cooldowns=cooldowns,
+                top=top,
+            )
+    except (FileNotFoundError, LookupError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+    finally:
+        conn.close()
+
+    shown = ", ".join(f"{p} {v}" for p, v in profs.items()) or "no professions"
+    console.print(
+        f"[bold]Crafts for {fac} ({shown})[/] · house {', '.join(map(str, res.house_ids))} · "
+        f"{res.recipes_total} recipes, {res.recipes_forever} from Wowhead captures"
+    )
+    table = Table(title="Crafts that make money (buying the materials)", title_justify="left")
+    for col, just in (
+        ("recipe", "left"),
+        ("mats", "right"),
+        ("sells for", "right"),
+        ("profit", "right"),
+        ("crafts/day", "right"),
+        ("per day", "right"),
+        ("learn", "left"),
+    ):
+        table.add_column(col, justify=just)
+    for e in res.crafts:
+        r = e.recipe
+        tag = " [yellow]Forever[/]" if r.source == "wowhead" else ""
+        table.add_row(
+            f"{r.name}{tag}\n[dim]{r.profession} {r.skill} → {e.output_name}[/]",
+            _gold(e.cost),
+            _gold(e.output_value),
+            _gold(e.profit),
+            f"{e.crafts_per_day:.1f}\n[dim]{e.limited_by}[/]",
+            _gold(e.profit_per_day),
+            e.learn_label + (f" {_gold(e.learn_cost)}" if e.learn_cost else ""),
+        )
+    console.print(table)
+    if res.processing:
+        proc = Table(title="Craft what you farm", title_justify="left")
+        for col, just in (
+            ("material", "left"),
+            ("sell raw", "right"),
+            ("best craft", "left"),
+            ("worth crafted", "right"),
+            ("per day", "right"),
+        ):
+            proc.add_column(col, justify=just)
+        for p in res.processing[:10]:
+            proc.add_row(
+                p.name,
+                _gold(p.raw_value),
+                f"{p.via.output_name}\n[dim]{p.via.recipe.name}[/]",
+                _gold(p.value_per_unit),
+                f"{p.units_per_day:.1f}" if p.units_per_day < 10 else f"{p.units_per_day:.0f}",
+            )
+        console.print(proc)

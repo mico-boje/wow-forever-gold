@@ -24,6 +24,8 @@ A local web app (127.0.0.1 only) with three pages:
   ranked farms with their evidence, leads from your Wowhead captures, a leveling sweep with a
   chart of the best gold/h per level, and a YAML download for testing. "Save as my profile"
   saves the character for the CLI too.
+- **Crafting:** crafts that make money buying the materials, and what to craft from your own
+  materials (see [Crafting](#crafting)).
 - **Capture:** the Wowhead to-do list and the userscript endpoint (see below).
 - **Status:** when the collector last ran, failures in the last 24 hours, and the log tail.
 
@@ -48,6 +50,7 @@ in your Windows browser (WSL forwards localhost).
 | `wowgold houses list` | Houses with faction and listing counts. `houses set-faction` to override. |
 | `wowgold vanilla fetch` | Download the VMaNGOS vanilla world database (loot tables, spawns) used by `discover`. |
 | `wowgold discover` | Generate farm hypotheses (mob camps, gathering loops) from vanilla data at current prices. |
+| `wowgold crafts -f horde -p alchemy:300` | Profitable crafts from bought materials, and what to craft from your own mats. |
 | `wowgold ui` | Local web UI: farms, leveling sweep, leads, Wowhead capture, collector status. |
 | `wowgold capture serve` | Same as `wowgold ui`, opening on the Capture page. |
 | `wowgold capture sources` | Item sources parsed from your captures, and whether `discover` can use them. |
@@ -188,6 +191,33 @@ rogue-only), your skinning/gathering skill, and elites only with `--elites` (dun
 never). Its "if plentiful" value counts only the captured items at your full kill speed, since
 there's no respawn data. Treat it as "worth a look", then measure it. `--leads N` sets how many
 to show; a `--levels` sweep shows the best lead per level.
+
+## Crafting
+
+Recipes come from the vanilla database (about 1,130 item-creating profession spells, with
+reagents, cooldowns, and how each is learned: trainer and fee, recipe item, or known from the
+start) plus Forever recipes from your Wowhead captures: the "Created by", "Reagent for" and
+"Teaches" tables on item pages you open. Forever data wins for the same recipe.
+
+**Buy, craft, sell.** For each recipe your skills can make (or all, with "show everything"):
+
+- materials at today's AH price, or a vendor's when cheaper (vendor stock is unlimited);
+- output at the AH price after the 5% cut, or vendor price when that's better (white
+  weapons/armor and soulbound items always at vendor);
+- crafts per day = the smallest of: your share of the output's daily sales, the materials
+  listed right now, the recipe's cooldown (transmutes, Mooncloth), and ~200 crafts of time;
+- learning cost (trainer fee, vendor or AH price of the recipe item) and how many crafts it
+  takes to pay back.
+
+**Craft what you farm.** For each material, the best recipe that turns it into more money than
+selling it raw, with the other materials bought, and how many a day the output market takes.
+On the Farms page, *Craft before selling* adds that to each farm's gold/h and re-ranks; the
+details say what to craft (e.g. "47 Sungrass → Invisibility Potion: 0.85g each instead of
+0.19g").
+
+Caveats: buying at the average price assumes you don't move the market; several materials
+feeding the same recipe each assume they get its full demand; Forever recipes from Wowhead
+have no cooldown data except transmutes (assumed 2 days).
 
 ## Measuring real yields
 

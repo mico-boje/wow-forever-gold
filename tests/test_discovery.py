@@ -35,7 +35,18 @@ LOOT_COLS = (
 )
 SCHEMA = f"""
 CREATE TABLE item_template (entry INT, patch INT, name TEXT, quality INT, sell_price INT,
-    bonding INT, class INT);
+    bonding INT, class INT, buy_price INT DEFAULT 0, spellid_1 INT DEFAULT 0,
+    spellid_2 INT DEFAULT 0, required_skill_rank INT DEFAULT 0);
+CREATE TABLE spell_template (entry INT, build INT, name TEXT, effect1 INT,
+    effectItemType1 INT DEFAULT 0, effectTriggerSpell1 INT DEFAULT 0,
+    effectBasePoints1 INT DEFAULT 0, effectDieSides1 INT DEFAULT 1, effectBaseDice1 INT DEFAULT 0,
+    recoveryTime INT DEFAULT 0, categoryRecoveryTime INT DEFAULT 0,
+    {", ".join(f"reagent{i} INT DEFAULT 0, reagentCount{i} INT DEFAULT 0" for i in range(1, 9))});
+CREATE TABLE skill_line_ability (build INT, skill_id INT, spell_id INT,
+    learn_on_get_skill INT DEFAULT 0, min_value INT DEFAULT 0);
+CREATE TABLE npc_trainer (spell INT, spellcost INT, reqskillvalue INT);
+CREATE TABLE npc_trainer_template (spell INT, spellcost INT, reqskillvalue INT);
+CREATE TABLE npc_vendor (item INT);
 CREATE TABLE faction_template (id INT, our_mask INT, friendly_mask INT, hostile_mask INT);
 CREATE TABLE creature_template (entry INT, patch INT, name TEXT, level_min INT, level_max INT,
     rank INT, type INT, loot_id INT, skinning_loot_id INT, gold_min INT, gold_max INT,
@@ -62,6 +73,8 @@ CREATE TABLE quest_template (ZoneOrSort INT, ReqCreatureOrGOId1 INT, ReqCreature
 """
 
 CLOTH, BONES, PATTERN, HIDE, HERB, GLOVES, QUEST = 100, 101, 102, 103, 104, 105, 106
+VIAL, DRAUGHT, RECIPE_ITEM, ELIXIR = 107, 108, 109, 110
+DRAUGHT_SPELL, TRANSMUTE_SPELL = 1001, 1003
 
 
 def build_world(path):
@@ -69,7 +82,8 @@ def build_world(path):
     c = sqlite3.connect(path)
     c.executescript(SCHEMA)
     c.executemany(
-        "INSERT INTO item_template VALUES (?,10,?,?,?,?,?)",
+        "INSERT INTO item_template (entry, patch, name, quality, sell_price, bonding, class) "
+        "VALUES (?,10,?,?,?,?,?)",
         [
             (CLOTH, "Runecloth", 1, 100, 0, 7),
             (BONES, "Old Bone", 0, 50, 0, 15),
@@ -161,6 +175,35 @@ def build_world(path):
             )
             guid += 1
     c.execute("INSERT INTO area_template VALUES (361, 1, 0, 'Felwood')")
+    # Recipes: a trainer-taught alchemy draught (2 Dreamfoil + a vendor vial) and a transmute
+    # with a 2-day cooldown taught by a vendor-sold recipe item.
+    c.executemany(
+        "INSERT INTO item_template (entry, patch, name, quality, sell_price, bonding, class, "
+        "buy_price, spellid_1, required_skill_rank) VALUES (?,10,?,?,?,0,?,?,?,?)",
+        [
+            (VIAL, "Crystal Vial", 1, 10, 7, 40, 0, 0),
+            (DRAUGHT, "Dreamfoil Draught", 1, 500, 0, 0, 0, 0),
+            (RECIPE_ITEM, "Recipe: Transmute Bone", 2, 1250, 9, 5000, 2002, 250),
+            (ELIXIR, "Bone Elixir", 1, 100, 0, 0, 0, 0),
+        ],
+    )
+    c.executemany(
+        "INSERT INTO spell_template (entry, build, name, effect1, effectItemType1, "
+        "effectTriggerSpell1, categoryRecoveryTime, reagent1, reagentCount1, reagent2, "
+        "reagentCount2) VALUES (?,5875,?,?,?,?,?,?,?,?,?)",
+        [
+            (DRAUGHT_SPELL, "Dreamfoil Draught", 24, DRAUGHT, 0, 0, HERB, 2, VIAL, 1),
+            (TRANSMUTE_SPELL, "Transmute: Bone", 24, ELIXIR, 0, 172800000, BONES, 1, 0, 0),
+            (2001, "Dreamfoil Draught", 36, 0, DRAUGHT_SPELL, 0, 0, 0, 0, 0),
+            (2002, "Recipe: Transmute Bone", 36, 0, TRANSMUTE_SPELL, 0, 0, 0, 0, 0),
+        ],
+    )
+    c.executemany(
+        "INSERT INTO skill_line_ability VALUES (5875, 171, ?, 0, ?)",
+        [(DRAUGHT_SPELL, 215), (TRANSMUTE_SPELL, 265)],
+    )
+    c.execute("INSERT INTO npc_trainer VALUES (2001, 1000, 200)")
+    c.executemany("INSERT INTO npc_vendor VALUES (?)", [(VIAL,), (RECIPE_ITEM,)])
     c.execute("INSERT INTO quest_template VALUES (361, 1, 0, 0, 0)")  # kill ogres in Felwood
     c.commit()
     c.close()
