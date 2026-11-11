@@ -9,6 +9,7 @@
   tr.skipped td:not(:last-child) { opacity: .4; text-decoration: line-through; }
   .skip { padding: 2px 8px; font-size: 12px; color: var(--muted); }
   #hint:empty { display: none; }
+  #hint { font-size: 15px; font-weight: 600; border-left: 4px solid var(--warn); }
 </style>
 {% endblock %}
 {% block main %}
@@ -103,8 +104,10 @@ document.getElementById("open").addEventListener("click", () => {
     setTimeout(() => {
       const win = window.open(tr.querySelector("a").href, "_blank");
       if (!win) {  // blocked: browsers allow one pop-up per click unless the site is allowed
-        hint.textContent = "Your browser blocked some tabs. Allow pop-ups for this page " +
-          "(icon at the right of the address bar), then click again.";
+        hint.textContent = "Only the first tab opened: your browser blocks a page from opening " +
+          "several tabs at once. Allow pop-ups for 127.0.0.1 (the blocked pop-up icon at the " +
+          "right of the address bar → Always allow), then click again.";
+        hint.scrollIntoView({ block: "nearest", behavior: "smooth" });
         return;
       }
       win.opener = null;

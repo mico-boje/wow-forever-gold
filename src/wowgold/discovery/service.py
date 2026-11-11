@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..planner.engine import PlanOptions
-from ..planner.pricing import build_price_book, pick_houses
+from ..planner.pricing import PriceBook, build_price_book, pick_houses
 from ..planner.profile import CharacterProfile
 from ..wowhead.sources import ItemSource, load_sources
 from . import vanilla
@@ -75,6 +75,7 @@ class DiscoverResult:
     unplaced: list[ItemSource] = field(default_factory=list)
     sales_coverage_h: float = 0.0
     sweep: bool = False
+    book: PriceBook | None = None  # prices and sell rates the farms were scored with
 
     @property
     def hidden_elite_leads(self) -> int:
@@ -111,6 +112,7 @@ def run_discover(
         unplaced=unplaced,
         sales_coverage_h=book.sales_coverage_h,
         sweep=bool(levels),
+        book=book,
     )
     for level in levels or [profile.level]:
         at = profile_at_level(profile, level) if levels else profile

@@ -35,8 +35,12 @@
   .rng { color: var(--muted); font-size: 13px; text-align: right; white-space: nowrap; }
   .body { padding: 4px 14px 16px 54px; }
   .body ul { margin: 6px 0; padding-left: 18px; }
-  .body table { max-width: 520px; margin-top: 8px; }
-  .body td { padding: 4px 6px; font-size: 14px; }
+  .body table { max-width: 820px; margin-top: 8px; }
+  .body td, .body th { padding: 4px 8px; font-size: 14px; }
+  .body th { font-size: 11px; }
+  .rate { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .rate.slow { color: var(--warn); font-weight: 600; }
+  .items .it { display: block; }
   @media (max-width: 700px) {
     .farm-head { display: none; }
     .farm > summary { grid-template-columns: 24px 1fr auto; }
@@ -63,6 +67,12 @@
   {%- if 'elite_mobs' in m.risk %}<span class="chip">elites</span>{% endif %}
 {%- endmacro %}
 
+{% macro rate_span(item_id, produced) -%}
+  {%- if rate -%}{%- set r = rate(item_id) -%}{%- set days = r.days_to_sell(produced) -%}
+  <span class="rate{{ ' slow' if days and days > form.sell_days }}" title="{% if r.market is none %}No AH listings: valued at vendor price{% else %}{{ 'Sold per day on the AH (measured)' if r.measured else 'Estimated sales per day (from listings; measured once the collector has 12h of history)' }}; {{ '{:,}'.format(r.listed) }} listed{% if days %}; your session's {{ '%.0f' | format(produced) }} = {{ '%.1f' | format(days) }} days of sales{% endif %}{% endif %}">{{ r.label() }}</span>
+  {%- endif -%}
+{%- endmacro %}
+
 {% macro farm_list(farms) %}
 <div class="farms">
   <div class="farm-head"><span>#</span><span>Farm</span><span>Needs</span>
@@ -81,22 +91,33 @@
       <span class="rng">{{ ev.low | gold }}–{{ ev.high | gold }}</span>
       <span class="items small">
         {%- for ln in (ev.lines | selectattr('item_id') | sort(attribute='value', reverse=True))[:3] -%}
-          {{ ln.name }}{{ ", " if not loop.last }}
+          <span class="it">{{ ln.name }} {{ rate_span(ln.item_id, ln.produced) }}</span>
         {%- endfor -%}
       </span>
     </summary>
     <div class="body">
       <div>{{ m.description }}</div>
       {% if c.evidence %}<ul class="small">{% for e in c.evidence[:8] %}<li>{{ e }}</li>{% endfor %}</ul>{% endif %}
-      <table>
+      <div class="scroll"><table>
+        <thead><tr><th>Item</th><th class="num">Per {{ form.hours | round(1) }}h</th><th class="num">Sells</th>
+          <th class="num">Listed</th><th class="num">Market</th><th>Sold via</th><th class="num">Value</th></tr></thead>
         {% for ln in (ev.lines | sort(attribute='value', reverse=True))[:8] %}
         <tr>
-          <td>{% if ln.item_id %}{{ "%.0f" | format(ln.produced) }} × {{ ln.name }}{% else %}coins + vendor trash{% endif %}</td>
-          <td class="small muted">{% if ln.item_id and ln.vendor_units >= 0.5 and ln.ah_units %}{{ "%.0f" | format(ln.ah_units) }} AH / {{ "%.0f" | format(ln.vendor_units) }} vendor{% elif ln.item_id and ln.vendor_units >= 0.5 %}vendor{% endif %}</td>
+          {% if ln.item_id %}{% set r = rate(ln.item_id) if rate else none %}
+          <td>{{ ln.name }}</td>
+          <td class="num">{{ "%.0f" | format(ln.produced) }}</td>
+          <td class="num">{{ rate_span(ln.item_id, ln.produced) }}</td>
+          <td class="num small muted">{{ "{:,}".format(r.listed) if r and r.market is not none else "" }}</td>
+          <td class="num small">{{ r.market | gold if r and r.market is not none else "" }}</td>
+          <td class="small muted">{% if ln.vendor_units >= 0.5 and ln.ah_units %}{{ "%.0f" | format(ln.ah_units) }} AH, {{ "%.0f" | format(ln.vendor_units) }} vendor{% elif ln.vendor_units >= 0.5 %}vendor{% else %}AH{% endif %}</td>
+          {% else %}
+          <td colspan="6">coins + vendor trash</td>
+          {% endif %}
           <td class="num">{{ ln.value | gold }}</td>
         </tr>
         {% endfor %}
-      </table>
+      </table></div>
+      <p class="small muted">Sells = units sold per day on your auction house ("~" = estimated from listings). Orange: this session alone would take longer than {{ form.sell_days | round(1) }} days to sell; the excess is valued at vendor price.</p>
       {% if ev.flags %}<ul class="small muted">{% for fl in ev.flags %}<li>{{ fl }}</li>{% endfor %}</ul>{% endif %}
       <div class="small muted">id <code>{{ m.id }}</code></div>
     </div>
@@ -119,7 +140,7 @@
       {{ {"drop": "kill", "skinning": "skin"}.get(lead.kind, lead.kind) }} · {{ src.source_type }} {{ src.source_id }}
       {% if src.level %} · lvl {{ src.level[0] }}–{{ src.level[1] }}{% endif %}</span></td>
     <td>{{ lead.zones[:2] | join(", ") or "?" }}</td>
-    <td class="small">{% for i in lead.items[:3] %}{{ i.name }} {{ "%.1f" | format(i.chance * 100) }}%{% if i.samples %} <span class="muted">(n={{ i.samples }})</span>{% endif %}<br>{% endfor %}</td>
+    <td class="small">{% for i in lead.items[:3] %}{{ i.name }} {{ "%.1f" | format(i.chance * 100) }}%{% if i.samples %} <span class="muted">(n={{ i.samples }})</span>{% endif %} {{ rate_span(i.item_id, i.chance * lead.rate * form.hours) }}<br>{% endfor %}</td>
     <td class="num"><strong>{{ lead.gold_per_hour | gold }}</strong>/h</td>
     <td>{% for fl in lead.flags %}<span class="chip">{{ fl }}</span>{% endfor %}</td>
   </tr>

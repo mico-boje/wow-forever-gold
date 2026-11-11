@@ -70,6 +70,37 @@ def ago(ts: str | None) -> str:
     return f"{mins // 1440} days ago"
 
 
+@dataclass(frozen=True)
+class SellRate:
+    """How fast an item sells on the AH, for showing next to farm yields."""
+
+    per_day: float | None  # units sold per day (measured), or estimated; None = not listed
+    measured: bool
+    listed: int
+    market: int | None
+
+    def label(self) -> str:
+        if self.market is None:
+            return "not on AH"
+        if self.per_day is None:
+            return "?"
+        n = self.per_day
+        txt = f"{n:,.0f}" if n >= 10 else f"{n:.1f}"
+        return f"{txt}/day" if self.measured else f"~{txt}/day"
+
+    def days_to_sell(self, units: float) -> float | None:
+        """Days of current AH sales that `units` would take (None if unknown)."""
+        if self.market is None or not self.per_day:
+            return None
+        return units / self.per_day
+
+
+def sell_rate(book, item_id: int) -> SellRate:
+    p = book.get(item_id)
+    per_day = p.sold_per_day if p.absorb_measured else p.absorb_per_day
+    return SellRate(per_day if p.market else None, p.absorb_measured, p.listed_qty, p.market)
+
+
 # -- the farms form --------------------------------------------------------------------------
 
 
@@ -288,6 +319,7 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
             gears=[g.value for g in GearTier],
             saved=saved,
             saved_msg=request.query_params.get("saved"),
+            rate=(lambda item_id: sell_rate(res.book, item_id)) if res and res.book else None,
         )
 
     @app.post("/profile")

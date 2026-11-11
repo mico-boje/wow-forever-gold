@@ -145,3 +145,28 @@ def test_verify_flow(env):
     assert client.post("/capture", json=record).json() == {"saved": "npc-1"}
     assert "npc-1" in client.get("/capture/status").json()
     assert ">verified</span>" in client.get(f"/farms?{FARM}").text
+
+
+def test_sell_rates():
+    from wowgold.planner.pricing import ItemPrice, PriceBook
+    from wowgold.web.app import sell_rate
+
+    book = PriceBook(
+        house_ids=[1],
+        prices={
+            1: ItemPrice(1, "Herb", 30000, 400, 100, None, 120.0, 120.0, True),
+            2: ItemPrice(2, "Rare", 900000, 3, 100, None, None, 0.75, False),
+            3: ItemPrice(3, "Bone", None, 0, 50, None, None, 0.0, False),
+        },
+    )
+    herb, rare, bone = sell_rate(book, 1), sell_rate(book, 2), sell_rate(book, 3)
+    assert herb.label() == "120/day" and herb.days_to_sell(60) == pytest.approx(0.5)
+    assert rare.label() == "~0.8/day" and rare.days_to_sell(3) == pytest.approx(4)
+    assert bone.label() == "not on AH" and bone.days_to_sell(10) is None
+
+
+def test_farm_details_show_sell_rates(env):
+    client, _ = env
+    page = client.get(f"/farms?{FARM}").text
+    assert '<th class="num">Sells</th>' in page
+    assert "Sells = units sold per day on your auction house" in page
