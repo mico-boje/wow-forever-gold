@@ -119,3 +119,29 @@ def test_helpers():
     )
     assert form.professions == {"mining": 300}
     assert "prof_mining=300" in form.query()
+
+
+def test_verify_flow(env):
+    client, data_dir = env
+    farms = client.get(f"/farms?{FARM}").text
+    assert 'href="/capture?' in farms and "Verify these farms on Wowhead" in farms
+
+    todo = client.get(f"/capture?{FARM}").text
+    assert "Verify farms on Wowhead" in todo
+    assert 'data-key="npc-1"' in todo and "forever/npc=1" in todo
+    assert "Ogre camp" in todo  # which farm the page verifies
+
+    record = {
+        "token": get_token(data_dir),
+        "url": "https://www.wowhead.com/forever/npc=1",
+        "title": "Ogre - NPC - Forever",
+        "listviews": {
+            "drops": {
+                "template": {"entityType": 3},
+                "data": [{"id": 100, "count": 500, "outof": 1000}],
+            }
+        },
+    }
+    assert client.post("/capture", json=record).json() == {"saved": "npc-1"}
+    assert "npc-1" in client.get("/capture/status").json()
+    assert ">verified</span>" in client.get(f"/farms?{FARM}").text

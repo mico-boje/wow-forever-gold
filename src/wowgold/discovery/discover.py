@@ -56,6 +56,9 @@ MAGE_AOE_MIN_GAP = 5
 MAGE_AOE_FACTOR = 2.0
 # Leveling sweep: assumed gathering/profession skill per character level (capped by --prof).
 SKILL_PER_LEVEL = 5
+# A captured Wowhead NPC/object page replaces the vanilla loot table once it's based on at
+# least this many kills/loots; below that it only adds/overrides the items it lists.
+PAGE_REPLACE_MIN_SAMPLES = 50
 MAX_LEVELS_ABOVE = 2  # skip mobs more than this many levels above you
 SPEED_YD_S = 7.0 * 1.6  # ground mount; the planner scales gathering for no mount / epic mount
 ROUTE_FACTOR = 1.5  # real paths vs. straight lines, and nodes you can't reach first
@@ -79,6 +82,8 @@ class VanillaData:
     extra: dict[tuple[str, int], dict[int, float]] = field(default_factory=dict)
     extra_notes: dict[tuple[str, int], list[str]] = field(default_factory=dict)
     area_names: dict[int, str] = field(default_factory=dict)  # area/zone id -> name
+    # Loot tables replaced wholesale by a captured Wowhead NPC/object page -> its sample size
+    replaced: dict[tuple[str, int], int] = field(default_factory=dict)
 
     @classmethod
     def load(cls, conn: sqlite3.Connection) -> VanillaData:
@@ -108,6 +113,7 @@ class VanillaData:
             if nt.entry in spawned_nodes:
                 node_by_name[nt.name].append(nt.entry)
         placed, unplaced = [], []
+        page_samples: dict[tuple[str, int], int] = {}
         for src in sources:
             if src.chance is None or src.chance <= 0:
                 continue
@@ -126,12 +132,26 @@ class VanillaData:
                 unplaced.append(src)
                 continue
             placed.append(src)
-            note = f"Wowhead: {src.chance:.1%} item {src.item_id}" + (
-                f" (n={src.samples})" if src.samples else ""
-            )
+            if src.from_page:
+                for key in keys:
+                    page_samples[key] = max(page_samples.get(key, 0), src.samples or 0)
+                note = None  # summarised once per page below
+            else:
+                note = f"Wowhead: {src.chance:.1%} item {src.item_id}" + (
+                    f" (n={src.samples})" if src.samples else ""
+                )
             for key in keys:
                 self.extra.setdefault(key, {})[src.item_id] = src.chance
-                self.extra_notes.setdefault(key, []).append(note)
+                if note:
+                    self.extra_notes.setdefault(key, []).append(note)
+        # A captured NPC/object page lists everything it drops in Forever: with enough
+        # samples, it replaces the vanilla loot table instead of patching it.
+        for key, n in page_samples.items():
+            if n >= PAGE_REPLACE_MIN_SAMPLES:
+                self.replaced[key] = n
+                self.extra_notes.setdefault(key, []).insert(
+                    0, f"Forever loot table from Wowhead (n={n})"
+                )
         return placed, unplaced
 
 
@@ -142,6 +162,15 @@ class Candidate:
     evaluation: Evaluation | None = None
     eligible: bool = True
     group: str = ""  # candidates with the same group are alternatives (e.g. skill tiers)
+    # Wowhead pages that verify this farm: ("npc" | "object", id, name), most valuable first
+    pages: list[tuple[str, int, str]] = field(default_factory=list)
+    verified: int = 0  # how many of `pages` have a Forever loot table captured
+
+    @property
+    def verified_label(self) -> str:
+        if not self.pages:
+            return ""
+        return f"{self.verified}/{len(self.pages)}"
 
 
 # -- pricing helpers -----------------------------------------------------------------------------
@@ -165,23 +194,26 @@ def unit_value(item_id: int, data: VanillaData, book: PriceBook) -> float:
     return max(ah, vendor)
 
 
-def _merged(base: dict[int, float], extra: dict[int, float] | None) -> dict[int, float]:
+def _loot(data: VanillaData, key: tuple[str, int], base: dict[int, float]) -> dict[int, float]:
+    extra = data.extra.get(key)
+    if key in data.replaced:
+        return dict(extra or {})
     return {**base, **extra} if extra else base
 
 
 def creature_loot(c: v.Creature, data: VanillaData) -> dict[int, float]:
     base = data.loot.expected("creature_loot_template", c.loot_id)
-    return _merged(base, data.extra.get(("creature", c.entry)))
+    return _loot(data, ("creature", c.entry), base)
 
 
 def skinning_loot(c: v.Creature, data: VanillaData) -> dict[int, float]:
     base = data.loot.expected("skinning_loot_template", c.skinning_loot_id)
-    return _merged(base, data.extra.get(("skinning", c.entry)))
+    return _loot(data, ("skinning", c.entry), base)
 
 
 def node_loot(nt: v.NodeType, data: VanillaData) -> dict[int, float]:
     base = data.loot.expected("gameobject_loot_template", nt.loot_id)
-    return _merged(base, data.extra.get(("node", nt.entry)))
+    return _loot(data, ("node", nt.entry), base)
 
 
 def skinning_skill_for(level: int) -> int:
@@ -413,6 +445,8 @@ def _camp_methods(data, profile, book, zone, map_id, x, y, mobs, kills) -> list[
     risk = ["competition"] + (["elite_mobs"] if elite else [])
     base_id = f"hyp_{_slug(zone)}_{_slug(top.name)}"
     group = base_id  # several camps of the same mob in a zone: keep the best
+    pages = [("npc", e, data.creatures[e].name) for e in mobs[:6]]
+    verified = sum(("creature", e) in data.replaced for e in mobs[:6])
     cands = [
         Candidate(
             _method_from_rates(
@@ -430,6 +464,8 @@ def _camp_methods(data, profile, book, zone, map_id, x, y, mobs, kills) -> list[
             ),
             evidence,
             group=group,
+            pages=pages,
+            verified=verified,
         )
     ]
     if skin_per_hour:
@@ -456,6 +492,8 @@ def _camp_methods(data, profile, book, zone, map_id, x, y, mobs, kills) -> list[
                 ),
                 evidence,
                 group=group,
+                pages=pages,
+                verified=verified,
             )
         )
     return cands
@@ -561,7 +599,21 @@ def gathering_zones(
                 ),
                 risk=["competition"],
             )
-            out.append(Candidate(method, evidence, group=f"gather:{prof}:{zone}"))
+            # one Wowhead object page per node name (vanilla has several entries per node)
+            by_name: dict[str, int] = {}
+            for entry, _a in sorted(active.items(), key=lambda kv: -kv[1]):
+                by_name.setdefault(data.node_types[entry].name, entry)
+            pages = [("object", e, name) for name, e in by_name.items()]
+            verified = sum(("node", e) in data.replaced for _, e, _ in pages)
+            out.append(
+                Candidate(
+                    method,
+                    evidence,
+                    group=f"gather:{prof}:{zone}",
+                    pages=pages,
+                    verified=verified,
+                )
+            )
     return out
 
 

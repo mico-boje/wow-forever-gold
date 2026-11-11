@@ -173,6 +173,14 @@ data is Wowhead's; keep it for personal use (it's gitignored) and don't redistri
 `discover` then adds each drop chance to the matching vanilla mob or node, so a mob that now
 drops Fel Crystal can surface as a new camp.
 
+**Verifying farms.** On the Farms page, *Verify these farms on Wowhead* turns the farms on
+screen (a single level or a whole leveling sweep) into a capture to-do list: the Wowhead
+NPC page of each camp's mobs and the object page of each gathering loop's nodes, with the farms
+each page belongs to. A captured NPC/object page brings that mob's or node's Forever loot table.
+With 50+ samples it replaces the vanilla loot table outright (items Forever removed disappear),
+below that it only patches the items it lists. Re-run the search and fully covered farms show
+as *verified* (partly covered ones as e.g. *2/3 verified*).
+
 Sources without open-world spawn points in the vanilla data (NPCs new in Forever, or mobs that
 only live inside dungeons) become **leads**, listed under the farms. A lead is filtered like a
 farm: hostile to your faction, at most 2 levels above you, your class (pickpocketing is

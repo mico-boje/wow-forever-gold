@@ -72,7 +72,10 @@
   <details class="farm">
     <summary>
       <span class="muted">{{ loop.index }}</span>
-      <span><span class="name">{{ m.name }}</span><br><span class="muted small">{{ m.zone }}</span></span>
+      <span><span class="name">{{ m.name }}</span>
+        {%- if c.pages and c.verified == c.pages | length %} <span class="chip ok" title="Forever loot tables captured for all its mobs/nodes">verified</span>
+        {%- elif c.verified %} <span class="chip" title="Forever loot tables captured for some of its mobs/nodes">{{ c.verified_label }} verified</span>{% endif %}
+        <br><span class="muted small">{{ m.zone }}</span></span>
       <span class="needs">{{ needs(m) }}</span>
       <span class="gph">{{ ev.gold_per_hour | gold }}</span>
       <span class="rng">{{ ev.low | gold }}–{{ ev.high | gold }}</span>
@@ -218,6 +221,8 @@
         {% if res.placed or res.unplaced %} · {{ res.placed | length }} Wowhead source(s) in camps, {{ res.unplaced | length }} as leads{% endif %}
         · <a href="/farms/hypotheses.yaml?{{ form.query() }}">download as YAML</a>
       </p>
+      <p><a class="btn" href="/capture?{{ form.query() }}">Verify these farms on Wowhead</a>
+        <span class="small muted">Capture the mobs' and nodes' Forever loot tables; verified farms are re-scored with them.</span></p>
       <div class="note warn small">Hypotheses from vanilla 1.12 data: drop rates, spawns and respawns may differ in Forever, and kill and gather rates are rough guesses. Test them in game, then record sessions.
         {% if res.sales_coverage_h < 12 %}Demand is estimated from listings until the collector has {{ "%.0f" | format(12 - res.sales_coverage_h) }} more hours of history.{% endif %}</div>
 

@@ -184,6 +184,19 @@ class FarmForm:
         return urlencode(q)
 
 
+@dataclass
+class VerifyPage:
+    key: str  # capture key, e.g. "npc-6559"
+    kind: str  # npc | object
+    entity_id: int
+    name: str
+    farms: list[str] = field(default_factory=list)
+
+    @property
+    def url(self) -> str:
+        return f"https://www.wowhead.com/forever/{self.kind}={self.entity_id}"
+
+
 # -- app -------------------------------------------------------------------------------------
 
 
@@ -316,6 +329,8 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
     @app.get("/capture", response_class=HTMLResponse)
     def capture_page(request: Request) -> HTMLResponse:
         saved = load_profile(s.profile_path)
+        if request.query_params.get("submitted"):
+            return verify_page(request, saved)
         exclude = set()
         if cache.available:
             data, *_ = cache.with_captures()
@@ -333,6 +348,33 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
             targets=targets,
             vanilla=bool(exclude),
             done=captured(s.wowgold_data_dir),
+        )
+
+    def verify_page(request: Request, saved: CharacterProfile | None) -> HTMLResponse:
+        """To-do list of the Wowhead NPC/object pages behind the farms on the Farms page."""
+        form = FarmForm.from_request(request.query_params, saved)
+        res, error = compute(form)
+        pages: dict[str, VerifyPage] = {}
+        farms = 0
+        for r in res.results if res else []:
+            for c in r.farms:
+                farms += 1
+                label = c.method.name + (f" (lvl {r.profile.level})" if res.sweep else "")
+                for kind, eid, name in c.pages:
+                    key = f"{kind}-{eid}"
+                    page = pages.setdefault(key, VerifyPage(key, kind, eid, name))
+                    if label not in page.farms:
+                        page.farms.append(label)
+        return render(
+            request,
+            "capture.html",
+            verify=list(pages.values()),
+            verify_farms=farms,
+            error=error or "; ".join(form.errors),
+            back=f"/farms?{form.query()}",
+            done=captured(s.wowgold_data_dir),
+            targets=[],
+            vanilla=True,
         )
 
     @app.get("/capture/status")

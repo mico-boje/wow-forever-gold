@@ -124,3 +124,47 @@ def test_parses_react_elite_boss_skill_and_item_name():
     assert sentinel.item_name == "Fel Crystal"
     assert by[4421].boss
     assert by[142142].kind == "herbalism" and by[142142].skill == 230
+
+
+def test_npc_page_becomes_its_loot_table(tmp_path):
+    from wowgold.wowhead.sources import sources_from_entity_page
+
+    record = {
+        "title": "Muculent Ooze - NPC - Forever",
+        "listviews": {
+            "drops": {
+                "template": {"entityType": 3},
+                "data": [
+                    {
+                        "id": 11834,
+                        "name": "1Un'Goro Soil",
+                        "count": 300,
+                        "outof": 1000,
+                        "stack": [1, 3],
+                    },
+                    {
+                        "id": 15736,
+                        "name": "3Pattern: Devilsaur Leggings",
+                        "count": 5,
+                        "outof": 1000,
+                    },
+                ],
+            },
+            "skinning": {
+                "template": {"entityType": 3},
+                "data": [{"id": 4304, "count": 40, "outof": 80}],
+            },
+            "sells": {"template": {"entityType": 3}, "data": [{"id": 1, "count": 1, "outof": 1}]},
+            "same-model-as": {"template": {"entityType": 1}, "data": [{"id": 6559}]},
+        },
+    }
+    by = {(s.kind, s.item_id): s for s in sources_from_entity_page(record, "npc", 6559)}
+    assert set(by) == {("drop", 11834), ("drop", 15736), ("skinning", 4304)}
+    soil = by[("drop", 11834)]
+    assert soil.chance == pytest.approx(0.3 * 2)  # mean stack of 1-3
+    assert soil.source_id == 6559 and soil.source_name == "Muculent Ooze"
+    assert soil.from_page and soil.samples == 1000
+    assert by[("drop", 15736)].item_name == "Pattern: Devilsaur Leggings"
+
+    save_capture(tmp_path, {"url": "https://www.wowhead.com/forever/npc=6559", **record})
+    assert {s.source_id for s in load_sources(tmp_path)} == {6559}

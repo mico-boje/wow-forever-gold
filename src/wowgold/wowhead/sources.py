@@ -32,6 +32,7 @@ class ItemSource:
     boss: bool = False
     skill: int | None = None  # gathering skill needed (gathered/mined-from objects)
     item_name: str = ""  # from the captured page's title
+    from_page: bool = False  # from the source's own NPC/object page (its full loot table)
 
     def friendly_to(self, faction: str) -> bool:
         if not self.react:
@@ -179,12 +180,105 @@ def sources_from_capture(record: dict, item_id: int) -> list[ItemSource]:
     return found
 
 
-def load_sources(data_dir: Path) -> list[ItemSource]:
+# -- NPC and object pages: the source's own loot table ---------------------------------------
+
+
+def _is_item_listview(template) -> bool:
+    """Real pages put a config object in `template` (entityType 3 = item); raw scripts a name."""
+    if isinstance(template, dict):
+        return template.get("entityType") == 3
+    return template == "item"
+
+
+def classify_entity_tab(page_kind: str, tab_id: str) -> str | None:
+    """Kind of loot an item tab on an NPC/object page lists, or None for other tabs
+    (sells, teaches, quest rewards, ...)."""
+    t = tab_id.lower()
+    if page_kind == "npc":
+        if "skinn" in t:
+            return "skinning"
+        if "pickpocket" in t:
+            return "pickpocket"
+        if t.startswith("drop"):
+            return "drop"
+        return None
+    if any(w in t for w in ("contain", "mining", "mined", "herb", "gather", "drop", "loot")):
+        return "object"
+    return None
+
+
+def name_from_title(title: str) -> str:
+    """'Muculent Ooze - NPC - Forever' -> 'Muculent Ooze'."""
+    return item_name_from_title(title)
+
+
+def _stack_mean(row: dict) -> float:
+    stack = row.get("stack")
+    if isinstance(stack, list) and len(stack) == 2:
+        lo, hi = _num(stack[0]), _num(stack[1])
+        if lo and hi:
+            return (lo + hi) / 2
+    return 1.0
+
+
+def sources_from_entity_page(record: dict, page_kind: str, entity_id: int) -> list[ItemSource]:
+    """Every item on a captured NPC/object page, as sources of that NPC/object.
+
+    `chance` is the expected count per kill/loot: Wowhead's count/outof times the mean stack."""
+    name = name_from_title(str(record.get("title") or ""))
+    tabs: list[tuple[str, object, list]] = [
+        (tab_id, lv.get("template"), lv.get("data") or [])
+        for tab_id, lv in (record.get("listviews") or {}).items()
+        if isinstance(lv, dict)
+    ]
+    seen = {t[0] for t in tabs}
+    for script in record.get("raw") or []:
+        for tab_id, template, rows in parse_raw_listviews(script):
+            if tab_id not in seen:
+                seen.add(tab_id)
+                tabs.append((tab_id, template, rows))
     out = []
-    for path in sorted(capture_dir(data_dir).glob("item-*.json")):
+    for tab_id, template, rows in tabs:
+        kind = classify_entity_tab(page_kind, tab_id)
+        if kind is None or not _is_item_listview(template) or not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict) or _num(row.get("id")) is None:
+                continue
+            count, outof = _num(row.get("count")), _num(row.get("outof"))
+            if count is None or not outof:
+                continue
+            out.append(
+                ItemSource(
+                    item_id=int(row["id"]),
+                    kind=kind,
+                    source_type="npc" if page_kind == "npc" else "object",
+                    source_id=entity_id,
+                    source_name=name,
+                    chance=max(0.0, count) / outof * _stack_mean(row),
+                    samples=int(outof),
+                    zones=(),
+                    item_name=str(row.get("name") or "").lstrip("0123456789"),
+                    from_page=True,
+                )
+            )
+    return out
+
+
+def load_sources(data_dir: Path) -> list[ItemSource]:
+    """Sources from every captured page: item pages (who drops this item) and NPC/object
+    pages (what this NPC/object drops)."""
+    out = []
+    for path in sorted(capture_dir(data_dir).glob("*.json")):
+        page_kind, _, raw_id = path.stem.partition("-")
+        if not raw_id.isdigit() or page_kind not in ("item", "npc", "object"):
+            continue
         try:
             record = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        out += sources_from_capture(record, int(path.stem.split("-", 1)[1]))
+        if page_kind == "item":
+            out += sources_from_capture(record, int(raw_id))
+        else:
+            out += sources_from_entity_page(record, page_kind, int(raw_id))
     return out

@@ -12,12 +12,19 @@
 </style>
 {% endblock %}
 {% block main %}
+{% if verify is defined %}
+<h1>Verify farms on Wowhead</h1>
+<p class="muted">The NPC and node pages behind the {{ verify_farms }} farm(s) on <a href="{{ back }}">your Farms page</a>. Each captured page brings that mob's or node's <strong>Forever</strong> loot table; with 50+ samples it replaces the vanilla guess, and the farm shows as verified. Install the <a href="/wowgold-capture.user.js">userscript</a> first if you haven't.</p>
+{% if error %}<div class="note bad">{{ error }}</div>{% endif %}
+{% else %}
 <h1>Wowhead capture</h1>
+<p><a href="/farms">Verify specific farms instead</a> <span class="muted small">(Farms page → Verify on Wowhead)</span></p>
 <ol>
   <li>Install the <a href="/wowgold-capture.user.js">userscript</a> in Tampermonkey or Violentmonkey (once). It only runs on Wowhead Forever item, NPC and object pages, and only sends to this app.</li>
   <li>Open the items below. A green "wowgold: saved" badge on the Wowhead page means it was captured. Captures feed the <a href="/farms">Farms</a> page right away.</li>
   <li>Skip anything crafted (bags, blueprints, bars, dyes): only drops and gathered items help.</li>
 </ol>
+{% endif %}
 {% if not vanilla %}<div class="note warn">No vanilla database (<code>wowgold vanilla fetch</code>), so this lists all items, not just Forever-only ones.</div>{% endif %}
 <div class="bar">
   <button id="open" class="primary">Open next 10 in new tabs</button>
@@ -26,6 +33,22 @@
 <p id="hint" class="note warn small"></p>
 <div class="panel scroll" style="padding:0">
 <table>
+{% if verify is defined %}
+  <thead><tr><th></th><th>Page</th><th>Used by</th><th></th></tr></thead>
+  <tbody>
+  {% for p in verify %}
+  <tr data-key="{{ p.key }}">
+    <td class="st"></td>
+    <td><a href="{{ p.url }}" target="_blank" rel="noopener">{{ p.name }}</a>
+      <br><span class="small muted">{{ "NPC" if p.kind == "npc" else "node" }} {{ p.entity_id }}</span></td>
+    <td class="small">{{ p.farms[:3] | join(", ") }}{% if p.farms | length > 3 %} <span class="muted">+{{ p.farms | length - 3 }} more</span>{% endif %}</td>
+    <td><button class="skip" type="button">skip</button></td>
+  </tr>
+  {% else %}
+  <tr><td colspan="4" class="muted">No farms to verify: run a search on the <a href="/farms">Farms</a> page first.</td></tr>
+  {% endfor %}
+  </tbody>
+{% else %}
   <thead><tr><th></th><th>Item ({{ targets | length }} most valuable {{ "Forever-only" if vanilla }})</th>
     <th class="num">Market</th><th class="num">Listed</th><th></th></tr></thead>
   <tbody>
@@ -41,6 +64,7 @@
   <tr><td colspan="5" class="muted">No auction data yet: run <code>wowgold collect --once</code>.</td></tr>
   {% endfor %}
   </tbody>
+{% endif %}
 </table>
 </div>
 <script>

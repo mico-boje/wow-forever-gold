@@ -476,3 +476,32 @@ def test_instance_only_vanilla_mob_is_a_lead(world, book, tmp_path):
         [ItemSource(248819, "drop", "npc", 2, "Boar", 0.1, 100, ())]
     )
     assert not placed and unplaced[0].source_id == 2
+
+
+def test_npc_page_replaces_vanilla_loot_and_verifies_camp(world, book):
+    from wowgold.wowhead.sources import ItemSource
+
+    data = VanillaData.load(world)
+    before = next(c for c in mob_camps(data, profile(), book) if c.method.name == "Ogre camp")
+    assert before.pages[0][:2] == ("npc", 1) and before.verified == 0
+    assert before.verified_label == "0/1"
+
+    page = dict(
+        kind="drop", source_type="npc", source_id=1, source_name="Ogre", zones=(), from_page=True
+    )
+    data.add_sources([ItemSource(item_id=HERB, chance=0.5, samples=400, **page)])
+    after = next(c for c in mob_camps(data, profile(), book) if c.method.name == "Ogre camp")
+    yields = {i.item for i in after.method.yields}
+    assert yields == {HERB}  # vanilla cloth and pattern are gone: Forever table replaces them
+    assert after.verified == 1
+    assert any("Forever loot table from Wowhead (n=400)" in e for e in after.evidence)
+
+
+def test_small_npc_page_only_patches(world, book):
+    from wowgold.wowhead.sources import ItemSource
+
+    data = VanillaData.load(world)
+    data.add_sources([ItemSource(HERB, "drop", "npc", 1, "Ogre", 0.5, 12, (), from_page=True)])
+    camp = next(c for c in mob_camps(data, profile(), book) if c.method.name == "Ogre camp")
+    assert {HERB, CLOTH} <= {i.item for i in camp.method.yields}
+    assert camp.verified == 0
