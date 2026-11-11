@@ -416,6 +416,40 @@ def prune_cmd(
         conn.close()
 
 
+def _report_new_items(conn, region: str, since: str) -> None:
+    """Log items listed for the first time in this cycle (after the collector's warm-up)."""
+    from datetime import datetime
+
+    from .market.firstseen import WARMUP, collection_start
+
+    start = collection_start(conn, region)
+    if start is None or datetime.fromisoformat(since) < start + WARMUP:
+        return
+    rows = conn.execute(
+        """
+        SELECT ps.item_id, COALESCE(i.name, 'item ' || ps.item_id) FROM price_stats ps
+        LEFT JOIN items i ON i.item_id = ps.item_id
+        WHERE ps.region = ? AND ps.quantity > 0
+        GROUP BY ps.item_id HAVING MIN(ps.ts) >= ?
+        """,
+        (region, since),
+    ).fetchall()
+    rows = [
+        r
+        for r in rows
+        if not conn.execute(
+            "SELECT 1 FROM price_daily WHERE region = ? AND item_id = ? LIMIT 1", (region, r[0])
+        ).fetchone()
+    ]
+    if rows:
+        shown = ", ".join(name for _, name in rows[:8])
+        more = f" and {len(rows) - 8} more" if len(rows) > 8 else ""
+        console.print(
+            f"[yellow]{len(rows)} item(s) on the AH for the first time:[/] {shown}{more} "
+            "(see New in Forever / Capture)"
+        )
+
+
 @app.command()
 def collect(
     region: RegionOpt = None,
@@ -426,7 +460,7 @@ def collect(
 ) -> None:
     """Snapshot -> ingest -> item sync -> prune, repeated every N minutes."""
     import time
-    from datetime import datetime
+    from datetime import UTC, datetime
 
     s = get_settings()
     while True:
@@ -442,8 +476,10 @@ def collect(
                 )
                 for err in summary.errors:
                     console.print(f"  [red]{err}[/]")
+                cycle_start = datetime.now(UTC).isoformat(timespec="seconds")
                 _ingest(conn)
                 _sync_items(conn, client, s.wowgold_data_dir)
+                _report_new_items(conn, region or s.wowgold_region, cycle_start)
                 _prune(conn, keep_raw, keep_hourly_days)
         except BlizzardAuthError as exc:
             console.print(f"[red]{exc}[/]")
@@ -1787,3 +1823,146 @@ def crafts(
                 f"{p.units_per_day:.1f}" if p.units_per_day < 10 else f"{p.units_per_day:.0f}",
             )
         console.print(proc)
+
+
+@app.command("new-items")
+def new_items_cmd(
+    faction: FactionOpt = None,
+    status: Annotated[
+        str | None,
+        typer.Option(help="Only this status: camp | lead | crafted | vendor | listed | unknown."),
+    ] = None,
+    top: Annotated[int, typer.Option(help="How many items to list.")] = 30,
+    region: RegionOpt = None,
+) -> None:
+    """Items new in Forever: price, sell rate and where they come from, most valuable first."""
+    from .discovery.newitems import STATUS_LABEL
+    from .discovery.service import VanillaCache, run_new_items
+
+    s = get_settings()
+    region = region or s.wowgold_region
+    saved = load_profile(s.profile_path)
+    fac = (faction or (saved.faction if saved else "")).lower()
+    if fac not in ("horde", "alliance"):
+        raise typer.BadParameter("pass --faction or save a profile")
+    conn = db.connect(s.db_path)
+    try:
+        res = run_new_items(
+            VanillaCache(s.wowgold_data_dir),
+            conn,
+            faction=fac,
+            region=region,
+            configured_houses=s.wowgold_houses,
+        )
+    except (FileNotFoundError, LookupError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+    finally:
+        conn.close()
+    o = res.overview
+    console.print(
+        f"[bold]{len(o.items)} items new in Forever[/] · house "
+        f"{', '.join(map(str, res.house_ids))} · "
+        + ", ".join(f"{STATUS_LABEL[k]} {v}" for k, v in sorted(o.counts.items()))
+    )
+    table = Table(title_justify="left")
+    for col, just in (
+        ("item", "left"),
+        ("price", "right"),
+        ("sells/day", "right"),
+        ("status", "left"),
+        ("where from", "left"),
+    ):
+        table.add_column(col, justify=just)
+    for it in [i for i in o.items if not status or i.status == status][:top]:
+        rate = (
+            "-" if it.sold_per_day is None else f"{'' if it.measured else '~'}{it.sold_per_day:.0f}"
+        )
+        table.add_row(
+            f"{it.name}\n[dim]{it.item_id}[/]",
+            _gold(it.market),
+            rate,
+            STATUS_LABEL[it.status],
+            "\n".join(src.text for src in it.sources[:2]),
+        )
+    console.print(table)
+    if o.unnamed:
+        console.print(f"[dim]{o.unnamed} unnamed: `wowgold items wowhead-names` looks them up.[/]")
+
+
+@items_app.command("wowhead-names")
+def items_wowhead_names(
+    limit: Annotated[int, typer.Option(help="Most names to look up in this run.")] = 1000,
+    faction: FactionOpt = None,
+    region: RegionOpt = None,
+) -> None:
+    """Look up names of new Forever items on Wowhead's tooltip API, one per second.
+
+    Names from your Wowhead captures are used first (free); this fetches the rest and stores
+    them, so each item is only ever looked up once."""
+    from .discovery.service import VanillaCache, run_new_items
+    from .wowhead.names import fetch_tooltip_names, unnamed_item_ids
+
+    s = get_settings()
+    region = region or s.wowgold_region
+    saved = load_profile(s.profile_path)
+    fac = (faction or (saved.faction if saved else "horde")).lower()
+    conn = db.connect(s.db_path)
+    try:
+        res = run_new_items(
+            VanillaCache(s.wowgold_data_dir),
+            conn,
+            faction=fac,
+            region=region,
+            configured_houses=s.wowgold_houses,
+        )
+        if res.names_added:
+            console.print(f"{res.names_added} names taken from your Wowhead captures.")
+        ids = unnamed_item_ids(
+            conn, {it.item_id for it in res.overview.items if it.name.startswith("item ")}
+        )[:limit]
+        if not ids:
+            console.print("Every new item has a name.")
+            return
+        console.print(f"Looking up {len(ids)} names (about {len(ids) // 60 + 1} min)...")
+
+        def progress(n: int, total: int, name: str | None) -> None:
+            if n % 25 == 0 or n == total:
+                console.print(f"  {n}/{total}" + (f" · {name}" if name else ""))
+
+        found, missing = fetch_tooltip_names(conn, ids, on_progress=progress)
+    except (FileNotFoundError, LookupError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+    finally:
+        conn.close()
+    console.print(f"[green]{found} found[/], {missing} unknown to Wowhead.")
+
+
+@capture_app.command("outdated")
+def capture_outdated(
+    top: Annotated[int, typer.Option(help="How many pages to list.")] = 30,
+) -> None:
+    """Outdated Wowhead captures, most worth recapturing first."""
+    from .wowhead.refresh import load_settings, recapture_queue
+
+    s = get_settings()
+    settings = load_settings(s.wowgold_data_dir)
+    queue = recapture_queue(s.wowgold_data_dir, lambda _i: 1.0)
+    console.print(
+        f"{len(queue)} outdated (older than {settings['stale_days']} days"
+        + (f" or before {settings['stale_before']}" if settings["stale_before"] else "")
+        + "). The Capture page in `wowgold ui` ranks them by value and opens them in tabs."
+    )
+    for r in queue[:top]:
+        console.print(f"  {r.key:<36} {r.reason:<36} {r.url}")
+
+
+@capture_app.command("mark-patch")
+def capture_mark_patch() -> None:
+    """After a Forever patch: mark every capture taken before now as outdated."""
+    from .wowhead.refresh import mark_patch
+
+    s = get_settings()
+    settings = mark_patch(s.wowgold_data_dir)
+    console.print(f"Captures before {settings['stale_before']} are now outdated.")

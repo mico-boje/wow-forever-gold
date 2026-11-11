@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -30,15 +31,18 @@ from ..config import Settings, get_settings
 from ..crafting.profit import CraftOptions
 from ..crafting.recipes import recipe_counts
 from ..discovery.discover import CLASS_KILL_SPEED, parse_levels, to_yaml_entries
-from ..discovery.service import VanillaCache, run_crafting, run_discover
+from ..discovery.newitems import STATUS_LABEL, STATUS_ORDER
+from ..discovery.service import VanillaCache, run_crafting, run_discover, run_new_items
+from ..market.firstseen import new_arrivals
 from ..market.myhouse import find_listing, load_my_houses, set_my_house
 from ..market.query import find_items
 from ..methods.models import PROFESSIONS, GearTier
 from ..planner.engine import PlanOptions
-from ..planner.pricing import ah_cut
+from ..planner.pricing import ah_cut, build_price_book
 from ..planner.profile import CharacterProfile
 from ..sessions import load_profile, parse_coins, save_profile
 from ..wowhead.capture import (
+    ITEM_LIST_PAGES,
     MAX_BODY,
     PROFESSION_PAGES,
     USERSCRIPT_VERSION,
@@ -51,10 +55,85 @@ from ..wowhead.capture import (
     script_version,
     userscript,
 )
+from ..wowhead.itemlists import list_page_counts
+from ..wowhead.names import fetch_tooltip_names, unnamed_item_ids
+from ..wowhead.refresh import (
+    load_settings,
+    mark_patch,
+    recapture_queue,
+    recent_changes,
+    save_settings,
+)
 
 TEMPLATES = Path(__file__).parent / "templates"
 CLASSES = sorted(CLASS_KILL_SPEED)
 KINDS = ("all", "farm", "gather")
+
+
+class NamesJob:
+    """Background lookup of item names on Wowhead's tooltip API (one per second)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._state = {"running": False, "done": 0, "total": 0, "found": 0, "last": None}
+
+    def state(self) -> dict:
+        with self._lock:
+            return dict(self._state)
+
+    def start(self, db_path, ids: list[int]) -> None:
+        with self._lock:
+            if self._state["running"] or not ids:
+                return
+            self._stop.clear()
+            self._state = {
+                "running": True,
+                "done": 0,
+                "total": len(ids),
+                "found": 0,
+                "last": None,
+            }
+
+        def progress(n: int, total: int, name: str | None) -> None:
+            with self._lock:
+                self._state.update(done=n, last=name)
+                if name:
+                    self._state["found"] += 1
+
+        def run() -> None:
+            conn = db.connect(db_path)
+            try:
+                fetch_tooltip_names(conn, ids, on_progress=progress, should_stop=self._stop.is_set)
+            finally:
+                conn.close()
+                with self._lock:
+                    self._state["running"] = False
+                log(f"name lookup finished: {self._state['found']} of {len(ids)} found")
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def ah_item_ids(conn, house_ids: list[int]) -> set[int]:
+    """Items listed in the latest snapshots of these houses."""
+    if not house_ids:
+        return set()
+    marks = ",".join("?" * len(house_ids))
+    return {
+        r[0]
+        for r in conn.execute(
+            f"""SELECT DISTINCT item_id FROM price_stats WHERE snapshot_id IN (
+                    SELECT MAX(id) FROM snapshots WHERE house_id IN ({marks})
+                      AND outcome = 'stored' AND ingested_at IS NOT NULL GROUP BY house_id, kind)
+                  AND quantity > 0""",
+            house_ids,
+        )
+    }
 
 
 def log(msg: str) -> None:
@@ -505,6 +584,24 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
                 if not saved or r["faction"] == saved.faction
             ]
             targets = pick_targets(conn, s.wowgold_region, houses, exclude, limit=40)
+            done = captured(s.wowgold_data_dir)
+            # what items trade for per day, to rank recaptures and new arrivals
+            book = build_price_book(conn, s.wowgold_region, houses, ah_item_ids(conn, houses))
+            arrivals = [
+                (i, ts, book.get(i))
+                for i, ts in new_arrivals(conn, s.wowgold_region).items()
+                if i not in exclude and f"item-{i}" not in done
+            ]
+            names = dict(conn.execute("SELECT item_id, name FROM items WHERE name IS NOT NULL"))
+
+        def item_value(item_id: int) -> float:
+            p = book.get(item_id)
+            if not p.market:
+                return 0.0
+            return p.market * ((p.sold_per_day if p.absorb_measured else p.absorb_per_day) or 0)
+
+        arrivals.sort(key=lambda a: -item_value(a[0]))
+        queue = recapture_queue(s.wowgold_data_dir, item_value)
         counts = recipe_counts(s.wowgold_data_dir)
         recipe_pages = [
             (key, name, url, counts.get(key))
@@ -520,8 +617,32 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
             last=last,
             script_version=USERSCRIPT_VERSION,
             vanilla=bool(exclude),
-            done=captured(s.wowgold_data_dir),
+            done=done,
+            arrivals=[(i, ts, p, names.get(i) or f"item {i}") for i, ts, p in arrivals[:40]],
+            queue=queue[:60],
+            queue_total=len(queue),
+            changes=recent_changes(s.wowgold_data_dir),
+            refresh=load_settings(s.wowgold_data_dir),
+            saved_msg=request.query_params.get("refresh"),
         )
+
+    @app.post("/capture/refresh")
+    async def capture_refresh(request: Request) -> Response:
+        """Refresh settings: outdated after N days, or mark a new patch (all outdated now)."""
+        if not same_origin(request):
+            return PlainTextResponse("cross-site request refused", status_code=403)
+        form = await request.form()
+        action = form.get("action")
+        if action == "mark-patch":
+            mark_patch(s.wowgold_data_dir)
+        elif action == "clear-mark":
+            save_settings(s.wowgold_data_dir, clear_mark=True)
+        elif form.get("stale_days"):
+            try:
+                save_settings(s.wowgold_data_dir, stale_days=int(form["stale_days"]))
+            except ValueError:
+                return PlainTextResponse("bad number", status_code=400)
+        return RedirectResponse(f"/capture?refresh={action or 'days'}", status_code=303)
 
     def verify_page(request: Request, saved: CharacterProfile | None) -> HTMLResponse:
         """To-do list of the Wowhead NPC/object pages behind the farms on the Farms page."""
@@ -583,6 +704,99 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
         old = " — outdated userscript, reinstall it" if version < USERSCRIPT_VERSION else ""
         log(f"captured {key} (userscript v{version}){old}")
         return JSONResponse({"saved": key})
+
+    # -- new in Forever ----------------------------------------------------------------------
+
+    names_job = NamesJob()
+
+    @app.get("/new", response_class=HTMLResponse)
+    def new_items(request: Request) -> HTMLResponse:
+        saved = load_profile(s.profile_path)
+        q = request.query_params
+        faction = q.get("faction") or (saved.faction if saved else "")
+        status = q.get("status") or ""
+        only_new = q.get("new") == "1"
+        search = (q.get("q") or "").strip().lower()
+        res, error = None, None
+        if faction not in ("horde", "alliance"):
+            error = "Pick a faction (or save a profile on the Farms page)."
+        elif not cache.available:
+            error = "The vanilla database is missing: run `wowgold vanilla fetch`."
+        else:
+            with connect() as conn:
+                try:
+                    res = run_new_items(
+                        cache,
+                        conn,
+                        faction=faction,
+                        region=s.wowgold_region,
+                        configured_houses=s.wowgold_houses,
+                    )
+                except LookupError as exc:
+                    error = str(exc)
+        items = []
+        if res:
+            items = [
+                it
+                for it in res.overview.items
+                if (not status or it.status == status)
+                and (not only_new or it.is_new)
+                and (not search or search in it.name.lower() or search == str(it.item_id))
+            ]
+        counts = list_page_counts(s.wowgold_data_dir)
+        list_pages = [
+            (key, name, url, counts.get(key))
+            for name, url in ITEM_LIST_PAGES
+            if (key := page_key(url))
+        ]
+        return render(
+            request,
+            "new.html",
+            res=res,
+            error=error,
+            faction=faction,
+            status=status,
+            only_new=only_new,
+            search=q.get("q") or "",
+            items=items[:300],
+            shown_of=len(items),
+            labels=STATUS_LABEL,
+            order=STATUS_ORDER,
+            list_pages=list_pages,
+            done=captured(s.wowgold_data_dir),
+            job=names_job.state(),
+        )
+
+    @app.post("/new/fetch-names")
+    async def fetch_names(request: Request) -> Response:
+        if not same_origin(request):
+            return PlainTextResponse("cross-site request refused", status_code=403)
+        saved = load_profile(s.profile_path)
+        faction = (await request.form()).get("faction") or (saved.faction if saved else "horde")
+        with connect() as conn:
+            res = run_new_items(
+                cache,
+                conn,
+                faction=faction,
+                region=s.wowgold_region,
+                configured_houses=s.wowgold_houses,
+            )
+            ids = unnamed_item_ids(
+                conn, {it.item_id for it in res.overview.items if it.name.startswith("item ")}
+            )
+        names_job.start(s.db_path, ids)
+        return RedirectResponse(f"/new?faction={faction}", status_code=303)
+
+    @app.get("/new/fetch-names/status")
+    def fetch_names_status() -> JSONResponse:
+        return JSONResponse(names_job.state())
+
+    @app.post("/new/fetch-names/stop")
+    async def fetch_names_stop(request: Request) -> Response:
+        if not same_origin(request):
+            return PlainTextResponse("cross-site request refused", status_code=403)
+        names_job.stop()
+        return JSONResponse(names_job.state())
 
     # -- houses ------------------------------------------------------------------------------
 

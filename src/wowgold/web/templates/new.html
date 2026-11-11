@@ -1,0 +1,158 @@
+{% extends "base.html" %}
+{% block title %}New in Forever · wowgold{% endblock %}
+{% block head %}
+<style>
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+  .chips a { text-decoration: none; }
+  .chips a.on .chip { background: var(--accent); color: var(--accent-fg); }
+  .filters { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; margin-bottom: 12px; }
+  .filters > div { min-width: 160px; }
+  .items { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+           overflow: hidden; }
+  .i-head, .it > summary { display: grid; gap: 12px; align-items: baseline; padding: 9px 14px;
+    grid-template-columns: minmax(0, 1.6fr) 80px 90px 120px minmax(0, 2fr); }
+  .i-head { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase;
+            letter-spacing: .04em; border-bottom: 1px solid var(--line); }
+  .it { border-bottom: 1px solid var(--line); }
+  .it:last-child { border-bottom: 0; }
+  .it > summary { cursor: pointer; list-style: none; }
+  .it > summary::-webkit-details-marker { display: none; }
+  .it > summary:hover, .it[open] > summary { background: var(--chip); }
+  .r { text-align: right; font-variant-numeric: tabular-nums; }
+  .body { padding: 4px 14px 14px; }
+  .body ul { margin: 4px 0; padding-left: 18px; }
+  .st-camp { color: var(--ok); } .st-lead, .st-crafted, .st-vendor { color: var(--accent); }
+  .st-unknown { color: var(--bad); }
+  .st-new { color: var(--accent-fg) !important; background: var(--accent) !important; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } }
+  @media (max-width: 700px) {
+    .i-head { display: none; }
+    .it > summary { grid-template-columns: 1fr auto; }
+    .it > summary > span:nth-child(n+3) { grid-column: 1 / 3; text-align: left; }
+  }
+  #names-progress:empty { display: none; }
+</style>
+{% endblock %}
+
+{% macro status_chip(s) %}<span class="chip st-{{ s }}">{{ labels[s] }}</span>{% endmacro %}
+
+{% block main %}
+<h1>New in Forever</h1>
+<p class="muted">Every item that isn't in vanilla: what it's worth on your auction house and what we know about where it comes from. Sources come from your Wowhead captures (drop tables, recipe lists, item lists, vendors) and your own play (the addon's loot log).</p>
+{% if error %}<div class="note bad">{{ error }}</div>{% endif %}
+
+{% if res %}{% set o = res.overview %}
+  {% with r = res %}{% include "_house_note.html" %}{% endwith %}
+  <div class="chips">
+    <a href="/new?faction={{ faction }}&q={{ search }}" class="{{ 'on' if not status and not only_new }}"><span class="chip">all {{ o.items | length }}</span></a>
+    {% if o.counts.get("new") %}<a href="/new?faction={{ faction }}&new=1&q={{ search }}" class="{{ 'on' if only_new }}"><span class="chip st-new">new this week {{ o.counts["new"] }}</span></a>{% endif %}
+    {% for s in order %}{% if o.counts.get(s) %}
+    <a href="/new?faction={{ faction }}&status={{ s }}&q={{ search }}" class="{{ 'on' if status == s }}"><span class="chip st-{{ s }}">{{ labels[s] }} {{ o.counts[s] }}</span></a>
+    {% endif %}{% endfor %}
+  </div>
+
+  <div class="grid2">
+    <div class="panel">
+      <strong>Fill the gaps</strong>
+      <ul class="small">
+        <li>{{ o.unnamed }} item(s) without a name.
+          {% if o.unnamed %}
+          <form method="post" action="/new/fetch-names" style="display:inline">
+            <input type="hidden" name="faction" value="{{ faction }}">
+            <button type="submit" class="skip" style="font-size:12px;padding:2px 8px" {{ 'disabled' if job.running }}>Look them up on Wowhead</button>
+          </form>
+          <span class="muted">(one per second, ~{{ (o.unnamed / 60) | round(0, 'ceil') | int }} min)</span>
+          {% endif %}
+          <div id="names-progress" class="muted">{% if job.running %}Looking up names: {{ job.done }} / {{ job.total }}…{% endif %}</div>
+        </li>
+        <li>{{ o.counts.get("unknown", 0) }} with no known source: capture Wowhead's item lists below, or the item pages on the <a href="/capture">Capture</a> page.</li>
+        {% if o.to_capture %}<li>{{ o.to_capture | length }} NPC/object page(s) named as sources but not captured (their drop rates turn "source known" into farms): see the list at the bottom.</li>{% endif %}
+      </ul>
+    </div>
+    <div class="panel">
+      <strong>Wowhead item lists</strong>
+      <p class="small muted" style="margin:4px 0">Each list shows where its items come from. Capture them with the userscript (version 4).</p>
+      <table class="small">
+        {% for key, name, url, count in list_pages %}
+        <tr><td class="st" style="color:var(--ok)">{{ "✓" if key in done }}</td><td><a href="{{ url }}" target="_blank" rel="noopener">{{ name }}</a></td>
+          <td class="num muted">{{ "%d items" % count if count is not none }}</td></tr>
+        {% endfor %}
+      </table>
+    </div>
+  </div>
+
+  {% if o.new_drops and not status and not search %}
+  <h2>New drops on old mobs</h2>
+  <p class="muted small">Forever items dropping from mobs that exist in vanilla, from your captured NPC pages. These are already counted in the Farms page's camps.</p>
+  <div class="panel scroll" style="padding:0"><table>
+    <thead><tr><th>Mob</th><th>Item</th><th class="num">Chance</th><th class="num">Worth per kill</th></tr></thead>
+    {% for d in o.new_drops[:12] %}
+    <tr><td><a href="https://www.wowhead.com/forever/npc={{ d.npc_id }}" target="_blank" rel="noopener">{{ d.mob }}</a></td><td>{{ d.item }}</td>
+      <td class="num">{{ "%.1f" | format(d.chance * 100) }}%{% if d.samples %} <span class="muted small">n={{ d.samples }}</span>{% endif %}</td>
+      <td class="num">{{ d.value_per_kill | gold }}</td></tr>
+    {% endfor %}
+  </table></div>
+  {% endif %}
+
+  <h2>Items</h2>
+  <form class="filters" method="get" action="/new">
+    <input type="hidden" name="faction" value="{{ faction }}">
+    {% if status %}<input type="hidden" name="status" value="{{ status }}">{% endif %}
+    <div><label for="q">Search</label><input id="q" name="q" value="{{ search }}" placeholder="name or ID"></div>
+    <button type="submit">Filter</button>
+    <span class="small muted">{{ shown_of }} item(s){% if shown_of > items | length %}, showing the first {{ items | length }}{% endif %}</span>
+  </form>
+  <div class="items">
+    <div class="i-head"><span>Item</span><span class="r">Price</span><span class="r">Sells/day</span><span>Status</span><span>Where from</span></div>
+    {% for it in items %}
+    <details class="it">
+      <summary>
+        <span><strong>{{ it.name }}</strong>{% if it.is_new %} <span class="chip st-new" title="First listed on your auction house {{ it.first_seen }}">NEW</span>{% endif %}{% if it.used_in %} <span class="chip" title="Forever recipes that use it">in {{ it.used_in }} recipe{{ "s" if it.used_in > 1 }}</span>{% endif %}</span>
+        <span class="r">{{ it.market | gold if it.market else "—" }}</span>
+        <span class="r">{% if it.sold_per_day is not none %}{{ "" if it.measured else "~" }}{{ "%.1f" | format(it.sold_per_day) if it.sold_per_day < 10 else it.sold_per_day | round | int }}{% else %}<span class="muted">not listed</span>{% endif %}</span>
+        <span>{{ status_chip(it.status) }}</span>
+        <span class="small">{{ it.sources[0].text if it.sources else "" }}{% if it.sources | length > 1 %} <span class="muted">+{{ it.sources | length - 1 }}</span>{% endif %}</span>
+      </summary>
+      <div class="body">
+        {% if it.sources %}<ul class="small">
+          {% for src in it.sources %}<li>{{ status_chip(src.kind) }} {% if src.url %}<a href="{{ src.url }}" target="_blank" rel="noopener">{{ src.text }}</a>{% else %}{{ src.text }}{% endif %}
+            {%- if src.chance %} — {{ "%.1f" | format(src.chance * 100) }}%{% if src.samples %} <span class="muted">(n={{ src.samples }})</span>{% endif %}{% endif %}
+            {%- if src.page and src.kind == "listed" and src.page not in done %} <span class="muted">· capture this page for its drop rate</span>{% endif %}</li>{% endfor %}
+        </ul>
+        {% else %}<p class="small muted">No source known yet. <a href="{{ it.url }}" target="_blank" rel="noopener">Open its Wowhead page</a> with the userscript running to capture where it drops.</p>{% endif %}
+        <div class="small muted">item <a href="{{ it.url }}" target="_blank" rel="noopener">{{ it.item_id }}</a>{% if it.listed %} · {{ "{:,}".format(it.listed) }} listed{% endif %}</div>
+      </div>
+    </details>
+    {% else %}
+    <div class="body muted">Nothing matches.</div>
+    {% endfor %}
+  </div>
+
+  {% if o.to_capture %}
+  <h2>Pages to capture next</h2>
+  <p class="muted small">Wowhead names these as sources of new items but we don't have their drop rates yet. Most valuable first.</p>
+  <div class="panel scroll" style="padding:0"><table>
+    <thead><tr><th>Page</th><th>For</th></tr></thead>
+    {% for p in o.to_capture[:40] %}
+    <tr><td><a href="{{ p.url }}" target="_blank" rel="noopener">{{ p.name }}</a> <span class="small muted">{{ p.kind }} {{ p.ref_id }}</span></td>
+      <td class="small">{{ p.items[:3] | join(", ") }}{% if p.items | length > 3 %} +{{ p.items | length - 3 }}{% endif %}</td></tr>
+    {% endfor %}
+  </table></div>
+  {% endif %}
+{% endif %}
+<script>
+{% if job.running %}
+async function poll() {
+  try {
+    const s = await (await fetch("/new/fetch-names/status")).json();
+    document.getElementById("names-progress").textContent = s.running
+      ? "Looking up names: " + s.done + " / " + s.total + " (" + s.found + " found)…"
+      : "Done: " + s.found + " of " + s.total + " names found. Reload to see them.";
+    if (s.running) setTimeout(poll, 2000);
+  } catch (e) {}
+}
+poll();
+{% endif %}
+</script>
+{% endblock %}

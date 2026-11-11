@@ -26,6 +26,8 @@ A local web app (127.0.0.1 only) with three pages:
   saves the character for the CLI too.
 - **Crafting:** crafts that make money buying the materials, and what to craft from your own
   materials (see [Crafting](#crafting)).
+- **New in Forever:** every item that isn't in vanilla, with price, sell rate and where it
+  comes from (see below).
 - **Capture:** the Wowhead to-do list and the userscript endpoint (see below).
 - **Houses:** find and save the auction house you trade on (see below).
 - **Status:** when the collector last ran, failures in the last 24 hours, and the log tail.
@@ -54,6 +56,9 @@ in your Windows browser (WSL forwards localhost).
 | `wowgold vanilla fetch` | Download the VMaNGOS vanilla world database (loot tables, spawns) used by `discover`. |
 | `wowgold discover` | Generate farm hypotheses (mob camps, gathering loops) from vanilla data at current prices. |
 | `wowgold crafts -f horde -p alchemy:300` | Profitable crafts from bought materials, and what to craft from your own mats. |
+| `wowgold new-items` | Items new in Forever: price, sell rate and known sources, most valuable first. |
+| `wowgold items wowhead-names` | Look up names of new items on Wowhead's tooltip API (1 per second, cached). |
+| `wowgold capture outdated` / `capture mark-patch` | List outdated Wowhead captures; after a patch, mark everything outdated. |
 | `wowgold ui` | Local web UI: farms, leveling sweep, leads, Wowhead capture, collector status. |
 | `wowgold capture serve` | Same as `wowgold ui`, opening on the Capture page. |
 | `wowgold capture sources` | Item sources parsed from your captures, and whether `discover` can use them. |
@@ -252,6 +257,58 @@ details say what to craft (e.g. "47 Sungrass → Invisibility Potion: 0.85g each
 Caveats: buying at the average price assumes you don't move the market; several materials
 feeding the same recipe each assume they get its full demand; Forever recipes from Wowhead
 have no cooldown data except transmutes (assumed 2 days).
+
+## New in Forever
+
+The **New in Forever** tab lists every item that isn't in the vanilla database, found on your
+auction house, in captured drop tables, Forever recipes, vendors and Wowhead item lists. Each
+has its price, sell rate and status:
+
+- **farmable:** a captured drop rate on a mob or node that spawns in the open world (it's
+  already part of the Farms page's camps);
+- **lead:** a drop rate from a mob without open-world spawns (new NPCs, dungeons);
+- **crafted:** a Forever recipe makes it (see the Crafting tab);
+- **vendor:** a Forever vendor sells it;
+- **source known, no rate:** a Wowhead item list names the mob or object, but its page isn't
+  captured yet; these pages are listed under *Pages to capture next*;
+- **seen in your play:** your addon loot log;
+- **source unknown:** nothing yet; capture its item page.
+
+*New drops on old mobs* highlights Forever items dropping from vanilla mobs, the cheapest new
+farms to test.
+
+**Names.** Blizzard's item API doesn't know many Forever items. Names come from your captures
+first, then from Wowhead's tooltip API (the endpoint sites use to embed tooltips): "Look them
+up on Wowhead" on the page, or `wowgold items wowhead-names`. It asks one item per second and
+stores every answer, so each item is looked up once. Blizzard's own names are never replaced.
+
+**Item lists.** Wowhead's item category pages (Trade Goods, Reagents, Consumables, Recipes,
+Miscellaneous, Quest items) say where each item comes from. Capture them with the userscript
+(version 4 also matches `/forever/items...`); links are on the New in Forever page.
+
+### Mobs that are new in Forever
+
+New mobs (and new zones like Riverglades) have no spawn data in the vanilla database, so on
+their own they're only leads. Capture the mob's Wowhead NPC page with userscript **v5** and it
+also sends the mob's map positions. wowgold then builds a real camp: the densest group of
+spawns on the zone map, kill speed for your class and level, the drop rates captured for it,
+and an assumed 6-minute respawn (Wowhead doesn't publish respawn times; coins aren't included
+either). These camps rank alongside the vanilla ones on the Farms page.
+
+### Keeping captures fresh
+
+Wowhead's samples grow and patches change drops, so the Capture page tracks age:
+
+- **Outdated captures:** older than 14 days (adjustable), or taken before your **patch mark**
+  (*New patch: mark all outdated* / `wowgold capture mark-patch` on patch day). They're listed
+  most-valuable-first: recipe and item lists, then NPC/object pages by what their drops trade
+  for (small Wowhead samples count double), then item pages. "Open next 10" works on them too;
+  a row is ticked once the page is captured again.
+- **What changed:** recapturing keeps the previous version (last 3) and lists new drops, drops
+  that disappeared, and rates that moved by 30%+ (and at least half a percentage point).
+- **New arrivals:** items listed on your AH for the first time in the past week (after the
+  collector's first hours) get a **NEW** badge on New in Forever, appear under *Just appeared
+  on the auction house* on the Capture page, and the hourly collector log names them.
 
 ## Measuring real yields
 

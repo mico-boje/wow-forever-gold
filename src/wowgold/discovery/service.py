@@ -18,10 +18,15 @@ from ..crafting.profit import (
     rank_crafts,
 )
 from ..crafting.recipes import Recipe, load_vanilla_recipes, load_wowhead_recipes, merge_recipes
+from ..market.firstseen import new_arrivals
 from ..market.myhouse import house_source, load_my_houses
 from ..planner.engine import PlanOptions
 from ..planner.pricing import PriceBook, build_price_book, cap_prices, pick_houses
 from ..planner.profile import CharacterProfile
+from ..wowhead.capture import captured
+from ..wowhead.entities import load_entities
+from ..wowhead.itemlists import load_item_hints
+from ..wowhead.names import captured_item_names, store_names
 from ..wowhead.sources import ItemSource, load_sources
 from ..wowhead.vendors import VendorOffer, load_vendor_offers
 from . import vanilla
@@ -32,8 +37,10 @@ from .discover import (
     candidate_item_ids,
     find_farms,
     find_leads,
+    forever_camps,
     profile_at_level,
 )
+from .newitems import Overview, build_overview, own_loot
 
 
 class VanillaCache:
@@ -155,6 +162,7 @@ def run_discover(
     if ctx is not None:
         ctx = ctx.with_offers(offers)
     craft_opts = CraftOptions(sell_days=opts.sell_days, market_share=opts.market_share)
+    entities = load_entities(cache.data_dir)
     out = DiscoverResult(
         profile=profile,
         house_ids=house_ids,
@@ -170,7 +178,9 @@ def run_discover(
     )
     for level in levels or [profile.level]:
         at = profile_at_level(profile, level) if levels else profile
-        farms = find_farms(data, at, book, opts, kind=kind, elites=elites)
+        fcamps = forever_camps(data, at, book, entities, unplaced, elites=elites)
+        camp_npcs = {c.pages[0][1] for c in fcamps}
+        farms = find_farms(data, at, book, opts, kind=kind, elites=elites, extra=fcamps)
         if craft and ctx is not None:
             proc = processing_options(recipes, book, ctx, craft_opts, at.professions)
             for c in farms:
@@ -179,7 +189,10 @@ def run_discover(
                 )
             farms.sort(key=lambda c: -c.total_per_hour)
         farms = farms[:top]
-        found = find_leads(data, unplaced, at, book, opts, elites=elites)[:leads]
+        lead_sources = [
+            u for u in unplaced if not (u.source_type == "npc" and u.source_id in camp_npcs)
+        ]
+        found = find_leads(data, lead_sources, at, book, opts, elites=elites)[:leads]
         out.results.append(LevelResult(at, farms, found))
     return out
 
@@ -249,4 +262,71 @@ def run_crafting(
         house_source=house_source(
             house_ids, faction, explicit=house, configured=configured_houses, mine=mine
         ),
+    )
+
+
+@dataclass
+class NewItemsResult:
+    overview: Overview
+    house_ids: list[int]
+    house_source: str
+    names_added: int
+
+
+def run_new_items(
+    cache: VanillaCache,
+    conn: sqlite3.Connection,
+    *,
+    faction: str,
+    region: str,
+    house: list[int] | None = None,
+    configured_houses: list[int] | None = None,
+) -> NewItemsResult:
+    """Every Forever-only item we know of, with its price and where it comes from."""
+    data, _ids, placed, unplaced = cache.with_captures()
+    recipes, _ctx, _ = cache.crafting()
+    names = captured_item_names(cache.data_dir)
+    names_added = store_names(conn, names)
+    mine = load_my_houses(cache.data_dir, region)
+    house_ids = pick_houses(conn, region, faction, house, configured_houses, mine)
+    if not house_ids:
+        raise LookupError("no auction data for that faction; run `wowgold collect --once`")
+    marks = ",".join("?" * len(house_ids))
+    ah_items = {
+        r[0]
+        for r in conn.execute(
+            f"""SELECT DISTINCT item_id FROM price_stats WHERE snapshot_id IN (
+                    SELECT MAX(id) FROM snapshots WHERE region = ? AND house_id IN ({marks})
+                      AND outcome = 'stored' AND ingested_at IS NOT NULL GROUP BY house_id, kind)
+                  AND quantity > 0""",
+            (region, *house_ids),
+        )
+    }
+    offers = load_vendor_offers(cache.data_dir)
+    hints = load_item_hints(cache.data_dir)
+    item_ids = ah_items | {s.item_id for s in placed + unplaced} | set(offers) | set(hints)
+    item_ids |= {i for r in recipes if r.source == "wowhead" for i in r.item_ids}
+    book = build_price_book(conn, region, house_ids, item_ids)
+    cap_prices(book, _caps(offers))
+    overview = build_overview(
+        data,
+        book,
+        ah_items=ah_items,
+        placed=placed,
+        unplaced=unplaced,
+        recipes=recipes,
+        offers=offers,
+        hints=hints,
+        names={i: n.name for i, n in names.items()},
+        captured=set(captured(cache.data_dir)),
+        yours=own_loot(conn),
+        arrivals=new_arrivals(conn, region),
+    )
+    return NewItemsResult(
+        overview=overview,
+        house_ids=house_ids,
+        house_source=house_source(
+            house_ids, faction, explicit=house, configured=configured_houses, mine=mine
+        ),
+        names_added=names_added,
     )

@@ -12,6 +12,7 @@ import re
 
 _IDENT_START = re.compile(r"[A-Za-z_$]")
 _IDENT = re.compile(r"[A-Za-z0-9_$]*")
+_NUMBER = re.compile(r"\d+(\.\d+)?([eE][+-]?\d+)?")
 
 
 def _read_string(s: str, i: int) -> tuple[str, int]:
@@ -56,6 +57,17 @@ def js_to_json(s: str) -> str:
                 out.append("null")
             else:
                 out.append(word)
+            i = j
+            continue
+        if ch.isdigit():
+            num = _NUMBER.match(s, i).group(0)
+            j = i + len(num)
+            k = j
+            while k < n and s[k].isspace():
+                k += 1
+            prev = next((c for c in reversed("".join(out[-3:])) if not c.isspace()), "")
+            # bare numeric object keys ({16591: ...}) need quotes in JSON
+            out.append(f'"{num}"' if k < n and s[k] == ":" and prev in "{," else num)
             i = j
             continue
         if ch == ",":

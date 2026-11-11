@@ -548,3 +548,16 @@ def test_small_npc_page_only_patches(world, book):
     camp = next(c for c in mob_camps(data, profile(), book) if c.method.name == "Ogre camp")
     assert {HERB, CLOTH} <= {i.item for i in camp.method.yields}
     assert camp.verified == 0
+
+
+def test_replaced_table_keeps_drops_too_rare_for_the_sample(world, book):
+    from wowgold.wowhead.sources import ItemSource
+
+    data = VanillaData.load(world)
+    # 100 kills: the pattern (1% → ~1 expected drop) can't be judged and stays; cloth
+    # (135 expected) and bones (30) would have shown up, so they're gone.
+    data.add_sources([ItemSource(HERB, "drop", "npc", 1, "Ogre", 0.5, 100, (), from_page=True)])
+    camp = next(c for c in mob_camps(data, profile(), book) if c.method.name == "Ogre camp")
+    items = {i.item for i in camp.method.yields}
+    assert items == {HERB, PATTERN}
+    assert camp.verified == 1

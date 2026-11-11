@@ -59,6 +59,10 @@ SKILL_PER_LEVEL = 5
 # A captured Wowhead NPC/object page replaces the vanilla loot table once it's based on at
 # least this many kills/loots; below that it only adds/overrides the items it lists.
 PAGE_REPLACE_MIN_SAMPLES = 50
+# When a captured page replaces a loot table, vanilla items it doesn't list are kept only if
+# Wowhead's sample was too small to have seen them: fewer than this many drops expected at the
+# vanilla rate. Items it should have seen but didn't are taken as removed in Forever.
+UNSEEN_EXPECTED_DROPS = 3.0
 MAX_LEVELS_ABOVE = 2  # skip mobs more than this many levels above you
 SPEED_YD_S = 7.0 * 1.6  # ground mount; the planner scales gathering for no mount / epic mount
 ROUTE_FACTOR = 1.5  # real paths vs. straight lines, and nodes you can't reach first
@@ -150,7 +154,7 @@ class VanillaData:
             if n >= PAGE_REPLACE_MIN_SAMPLES:
                 self.replaced[key] = n
                 self.extra_notes.setdefault(key, []).insert(
-                    0, f"Forever loot table from Wowhead (n={n})"
+                    0, f"Forever loot table from Wowhead (n={n}), plus rare drops too rare to show"
                 )
         return placed, unplaced
 
@@ -204,7 +208,13 @@ def unit_value(item_id: int, data: VanillaData, book: PriceBook) -> float:
 def _loot(data: VanillaData, key: tuple[str, int], base: dict[int, float]) -> dict[int, float]:
     extra = data.extra.get(key)
     if key in data.replaced:
-        return dict(extra or {})
+        samples = data.replaced[key]
+        rare = {
+            item: q
+            for item, q in base.items()
+            if q * samples < UNSEEN_EXPECTED_DROPS and item not in (extra or {})
+        }
+        return {**rare, **(extra or {})}
     return {**base, **extra} if extra else base
 
 
@@ -685,10 +695,12 @@ def find_farms(
     *,
     kind: str = "all",
     elites: bool = False,
+    extra: list[Candidate] | None = None,
 ) -> list[Candidate]:
     cands: list[Candidate] = []
     if kind in ("all", "farm"):
         cands += mob_camps(data, profile, book, elites=elites)
+        cands += extra or []
     if kind in ("all", "gather"):
         cands += gathering_zones(data, profile, book)
     return rank(cands, profile, book, opts)
@@ -850,3 +862,147 @@ def find_leads(
         leads.append(Lead(src, kind, zones, rate, items, total, flags))
     leads.sort(key=lambda lead: -lead.gold_per_hour)
     return leads
+
+
+# -- camps for mobs that are new in Forever (positions from Wowhead) ------------------------------
+
+FOREVER_RESPAWN_S = 360  # Wowhead doesn't publish respawn times; vanilla mobs mostly use 5-7 min
+MAP_CELL_PCT = 3.0  # % of a zone map per grid cell (~100-150 yards on most zones)
+
+
+def _best_cluster(points) -> tuple[int, float, float, int | None, str | None]:
+    """(spawns, x, y, zone id, zone name) of the densest 3x3-cell window."""
+    by_zone: dict[tuple, list] = defaultdict(list)
+    for p in points:
+        by_zone[(p.zone_id, p.zone_name)].append(p)
+    best = (0, 0.0, 0.0, None, None)
+    for (zone_id, zone_name), pts in by_zone.items():
+        cells: dict[tuple[int, int], list] = defaultdict(list)
+        for p in pts:
+            cells[(int(p.x // MAP_CELL_PCT), int(p.y // MAP_CELL_PCT))].append(p)
+        for cx, cy in cells:
+            window = [
+                p
+                for dx in (-1, 0, 1)
+                for dy in (-1, 0, 1)
+                for p in cells.get((cx + dx, cy + dy), ())
+            ]
+            if len(window) > best[0]:
+                x = sum(p.x for p in window) / len(window)
+                y = sum(p.y for p in window) / len(window)
+                best = (len(window), x, y, zone_id, zone_name)
+    return best
+
+
+def forever_camps(
+    data: VanillaData,
+    profile: CharacterProfile,
+    book: PriceBook,
+    entities: dict,
+    unplaced: list[ItemSource],
+    *,
+    elites: bool = False,
+) -> list[Candidate]:
+    """Camps for mobs with no vanilla spawns, from their captured Wowhead page: map positions
+    (spawn count and place), level/hostility, and the drop rates captured for them."""
+    loot: dict[int, list[ItemSource]] = defaultdict(list)
+    for src in unplaced:
+        if src.source_type == "npc" and src.chance and src.kind in ("drop", "skinning"):
+            loot[src.source_id].append(src)
+    out = []
+    for npc_id, sources in loot.items():
+        ent = entities.get(("npc", npc_id))
+        if ent is None or not ent.points:
+            continue
+        info = ent.info
+        first = sources[0]
+        level = (info.level if info else None) or first.level
+        elite = (info.elite if info else False) or first.elite
+        name = (info.name if info else "") or first.source_name or f"NPC {npc_id}"
+        if (info and (info.boss or info.friendly_to(profile.faction))) or first.boss:
+            continue
+        if first.friendly_to(profile.faction) or (elite and not elites):
+            continue
+        lo, hi = level or (profile.level, profile.level)
+        if lo > profile.level + MAX_LEVELS_ABOVE:
+            continue
+        spawns, x, y, zone_id, zone_name = _best_cluster(ent.points)
+        if not spawns:
+            continue
+        mob = v.Creature(
+            npc_id,
+            name,
+            lo,
+            hi,
+            v.RANK_ELITE if elite else v.RANK_NORMAL,
+            0,
+            0,
+            0,
+            0,
+            0,
+            frozenset(),
+        )
+        kills = min(
+            kills_per_hour(mob, profile.level, profile.cls), spawns * 3600 / FOREVER_RESPAWN_S
+        )
+        skinning_need = skinning_skill_for(hi)
+        can_skin = profile.professions.get("skinning", 0) >= skinning_need
+        per_hour: dict[int, float] = defaultdict(float)
+        skinned = False
+        samples = 0
+        for src in sources:
+            if src.kind == "skinning":
+                if not can_skin:
+                    continue
+                skinned = True
+            per_hour[src.item_id] += kills * src.chance
+            samples = max(samples, src.samples or 0)
+        if not per_hour:
+            continue
+        zone = (
+            zone_name
+            or data.area_names.get(zone_id or 0)
+            or (data.area_names.get(info.zones[0]) if info and info.zones else None)
+            or f"zone {zone_id}"
+        )
+        total = len(ent.points)
+        reqs = Requirements(
+            level=max(1, min(60, hi - MAX_LEVELS_ABOVE)),
+            gear=GearTier.PRERAID if elite else GearTier.LEVELING,
+            professions={"skinning": skinning_need} if skinned else {},
+        )
+        method = _method_from_rates(
+            mid=f"hyp_{_slug(zone)}_{_slug(name)}",
+            name=f"{name} camp" + (" + skinning" if skinned else ""),
+            kind=Kind.FARM,
+            zone=zone,
+            reqs=reqs,
+            items_per_hour=per_hour,
+            coins_per_hour=0,
+            data=data,
+            book=book,
+            description=(
+                f"Kill {name} (new in Forever). {zone}, around map ({x:.0f}, {y:.0f}): "
+                f"{spawns} spawns close together, {total} on Wowhead's map. Respawn assumed "
+                f"{FOREVER_RESPAWN_S // 60} min; coins not included. Kill rates assume a level "
+                f"{profile.level} {profile.cls}."
+            ),
+            risk=["competition", "assumed_respawn"] + (["elite_mobs"] if elite else []),
+        )
+        evidence = [
+            f"{name} (lvl {lo}-{hi}{', elite' if elite else ''}): {kills:.0f} kills/h",
+            f"positions: {spawns} spawns near ({x:.0f}, {y:.0f}) of {total} from Wowhead",
+        ] + [
+            f"Wowhead: {s.chance:.1%} item {s.item_id}" + (f" (n={s.samples})" if s.samples else "")
+            for s in sorted(sources, key=lambda s: -(s.chance or 0))[:5]
+        ]
+        out.append(
+            Candidate(
+                method,
+                evidence,
+                group=f"fcamp:{npc_id}",
+                pages=[("npc", npc_id, name)],
+                verified=1 if samples >= PAGE_REPLACE_MIN_SAMPLES else 0,
+            )
+        )
+    return out

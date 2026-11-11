@@ -207,3 +207,9 @@ def test_js_style_listview_data():
     ((tab, template, rows),) = parse_raw_listviews(script)
     assert (tab, template) == ("spells", "spell")
     assert rows == [{"id": 1, "creates": [2, 1, 1], "quality": -1, "popularity": 207}]
+
+
+def test_numeric_keys_in_js_data():
+    from wowgold.wowhead.jsdata import parse_js
+
+    assert parse_js("{16591: {0: [1.5, -2e3]}, a: 3}") == {"16591": {"0": [1.5, -2000.0]}, "a": 3}

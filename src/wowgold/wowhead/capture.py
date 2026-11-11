@@ -11,6 +11,7 @@ to the local app.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import secrets
@@ -25,10 +26,26 @@ WOWHEAD = "https://www.wowhead.com/forever"
 MAX_BODY = 64 * 1024 * 1024  # profession recipe lists are big
 # Bump when the userscript changes; captures record the version that sent them, so the app
 # can tell you when the installed one is outdated.
-USERSCRIPT_VERSION = 3
+USERSCRIPT_VERSION = 5
+HISTORY_KEEP = 3  # previous versions kept per page, to show what changed on a recapture
 PAGE_RE = re.compile(r"wowhead\.com/forever/(item|npc|object)=(\d+)")
 # Spell list pages, e.g. /forever/spells/professions/alchemy: every recipe of a profession.
 SPELLS_RE = re.compile(r"wowhead\.com/forever/spells/([a-z0-9/-]+)")
+# Item list pages, e.g. /forever/items/trade-goods or /forever/items?filter=...: every item of
+# a category with where it comes from.
+ITEMS_RE = re.compile(r"wowhead\.com/forever/items(/[a-z0-9/-]*)?(\?[^#]*)?")
+
+ITEM_LIST_PAGES = [
+    (name, f"{WOWHEAD}/items/{path}")
+    for name, path in (
+        ("Trade Goods", "trade-goods"),
+        ("Reagents", "reagents"),
+        ("Consumables", "consumables"),
+        ("Recipes", "recipes"),
+        ("Miscellaneous", "miscellaneous"),
+        ("Quest items", "quest"),
+    )
+]
 
 # One list page per profession holds all its recipes (reagents, output, skill, trainer fee).
 PROFESSION_PAGES = [
@@ -53,6 +70,13 @@ def page_key(url: str) -> str | None:
         return f"{match[1]}-{match[2]}"
     if match := SPELLS_RE.search(url):
         return "spells-" + match[1].strip("/").replace("/", "-")
+    if match := ITEMS_RE.search(url):
+        path = (match[1] or "").strip("/").replace("/", "-") or "all"
+        query = match[2] or ""
+        if query:
+            digest = hashlib.sha1(query.encode()).hexdigest()[:8]
+            return f"items-{path}-{digest}"
+        return f"items-{path}"
     return None
 
 
@@ -90,6 +114,35 @@ def script_version(payload: dict) -> int:
         return 1
 
 
+def history_dir(data_dir: Path, key: str) -> Path:
+    return data_dir / "wowhead" / "history" / key
+
+
+def _archive(data_dir: Path, key: str, path: Path) -> None:
+    """Keep the previous version of a page before it's overwritten."""
+    try:
+        old = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    stamp = re.sub(r"[^0-9T]", "", str(old.get("captured_at") or "old"))[:15] or "old"
+    hist = history_dir(data_dir, key)
+    hist.mkdir(parents=True, exist_ok=True)
+    (hist / f"{stamp}.json").write_text(json.dumps(old))
+    for stale in sorted(hist.glob("*.json"))[:-HISTORY_KEEP]:
+        stale.unlink()
+
+
+def previous_capture(data_dir: Path, key: str) -> dict | None:
+    """The version of a page captured before the current one, if kept."""
+    files = sorted(history_dir(data_dir, key).glob("*.json"))
+    if not files:
+        return None
+    try:
+        return json.loads(files[-1].read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def last_capture(data_dir: Path) -> dict | None:
     """{key, version, at} of the most recent capture, if any."""
     path = data_dir / "wowhead" / "last_capture.json"
@@ -122,11 +175,15 @@ def save_capture(data_dir: Path, payload: dict) -> str:
         "captured_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "script_version": script_version(payload),
         "listviews": payload.get("listviews") or {},
+        "mapper": payload.get("mapper") if isinstance(payload.get("mapper"), dict) else None,
         "raw": [s for s in payload.get("raw") or [] if isinstance(s, str)][:50],
     }
     out = capture_dir(data_dir)
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"{key}.json").write_text(json.dumps(record))
+    path = out / f"{key}.json"
+    if path.exists():
+        _archive(data_dir, key, path)
+    path.write_text(json.dumps(record))
     (data_dir / "wowhead" / "last_capture.json").write_text(
         json.dumps({"key": key, "version": record["script_version"], "at": record["captured_at"]})
     )
@@ -199,6 +256,7 @@ USERSCRIPT = r"""// ==UserScript==
 // @match        https://www.wowhead.com/forever/npc=*
 // @match        https://www.wowhead.com/forever/object=*
 // @match        https://www.wowhead.com/forever/spells/*
+// @match        https://www.wowhead.com/forever/items*
 // @updateURL    http://127.0.0.1:__PORT__/wowgold-capture.user.js
 // @downloadURL  http://127.0.0.1:__PORT__/wowgold-capture.user.js
 // @grant        GM_xmlhttpRequest
@@ -237,10 +295,15 @@ USERSCRIPT = r"""// ==UserScript==
     return out;
   }
 
+  function mapper() {
+    // map positions on NPC/object pages (the dots on Wowhead's map)
+    try { return page.g_mapperData ? plain(page.g_mapperData) : null; } catch (e) { return null; }
+  }
+
   function raw() {
     return Array.from(document.scripts)
       .map((s) => s.textContent || "")
-      .filter((t) => t.includes("Listview"))
+      .filter((t) => t.includes("Listview") || t.includes("g_mapperData") || t.includes("g_npcs"))
       .map((t) => t.slice(0, 2000000));
   }
 
@@ -260,7 +323,7 @@ USERSCRIPT = r"""// ==UserScript==
   function send() {
     const payload = {
       token: TOKEN, version: __VERSION__, url: location.href, title: document.title,
-      listviews: listviews(), raw: raw(),
+      listviews: listviews(), raw: raw(), mapper: mapper(),
     };
     GM_xmlhttpRequest({
       method: "POST", url: ENDPOINT, data: JSON.stringify(payload),
