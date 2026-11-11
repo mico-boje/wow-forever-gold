@@ -155,3 +155,29 @@ def build_price_book(
             absorb_measured=measured and sold_per_day is not None,
         )
     return book
+
+
+def pick_houses(
+    conn: sqlite3.Connection,
+    region: str,
+    faction: str,
+    explicit: list[int] | None = None,
+    configured: list[int] | None = None,
+) -> list[int]:
+    """Houses to price with: explicit choice, else WOWGOLD_HOUSES, else the busiest house of
+    the faction."""
+    if explicit:
+        return list(explicit)
+    if configured:
+        return list(configured)
+    from .. import db
+
+    candidates = [
+        r
+        for r in db.list_houses(conn, region)
+        if r["faction"] == faction and (r["last_auctions"] or r["last_commodities"])
+    ]
+    if not candidates:
+        return []
+    best = max(candidates, key=lambda r: (r["last_auctions"] or 0) + (r["last_commodities"] or 0))
+    return [best["house_id"]]

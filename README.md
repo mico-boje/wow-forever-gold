@@ -12,6 +12,24 @@ cp .env.example .env   # add BLIZZARD_CLIENT_ID / BLIZZARD_CLIENT_SECRET
 Create API credentials at https://develop.battle.net/access/clients. Use a supported locale
 (`en_GB`, `en_US`, `de_DE`, …) — an unsupported one makes Blizzard return empty names.
 
+## Web UI
+
+```bash
+uv run wowgold ui            # http://127.0.0.1:8765/
+```
+
+A local web app (127.0.0.1 only) with three pages:
+
+- **Farms:** enter class, level, faction and professions (or use your saved profile) and get
+  ranked farms with their evidence, leads from your Wowhead captures, a leveling sweep with a
+  chart of the best gold/h per level, and a YAML download for testing. "Save as my profile"
+  saves the character for the CLI too.
+- **Capture:** the Wowhead to-do list and the userscript endpoint (see below).
+- **Status:** when the collector last ran, failures in the last 24 hours, and the log tail.
+
+The CLI stays the tool for cron and scripting; both use the same code. On WSL, open the address
+in your Windows browser (WSL forwards localhost).
+
 ## Commands
 
 | Command | What it does |
@@ -28,6 +46,11 @@ Create API credentials at https://develop.battle.net/access/clients. Use a suppo
 | `wowgold methods show herb_felwood` | Estimated vs measured vs calibrated yields for a method. |
 | `wowgold methods list` / `methods check` | Show curated methods; verify their item IDs against Blizzard's item data. |
 | `wowgold houses list` | Houses with faction and listing counts. `houses set-faction` to override. |
+| `wowgold vanilla fetch` | Download the VMaNGOS vanilla world database (loot tables, spawns) used by `discover`. |
+| `wowgold discover` | Generate farm hypotheses (mob camps, gathering loops) from vanilla data at current prices. |
+| `wowgold ui` | Local web UI: farms, leveling sweep, leads, Wowhead capture, collector status. |
+| `wowgold capture serve` | Same as `wowgold ui`, opening on the Capture page. |
+| `wowgold capture sources` | Item sources parsed from your captures, and whether `discover` can use them. |
 | `wowgold prune` | Delete old raw files (keeps 2 per house) and roll hourly stats older than 14 days into daily rows. |
 
 Set `WOWGOLD_HOUSES=[113]` in `.env` to limit `prices` to the house(s) you trade on.
@@ -37,12 +60,15 @@ Names for items the API doesn't know can be added to `data/item_overrides.csv`
 
 ### Running the collector in the background
 
-The simplest option is a terminal tab running `uv run wowgold collect`. For an unattended setup, a
-cron entry such as:
+The simplest option is a terminal tab running `uv run wowgold collect`. For an unattended setup, use
+cron with [scripts/collect-cron.sh](scripts/collect-cron.sh), which runs one cycle, appends output to
+`data/collect.log`, and skips a run if the previous one hasn't finished:
 
 ```
-5 * * * * cd /path/to/wow-forever && /path/to/uv run wowgold collect --once >> data/collect.log 2>&1
+5 * * * * /path/to/wow-forever-gold/scripts/collect-cron.sh
 ```
+
+Install it with `crontab -e`. On WSL, cron only runs while the WSL VM is up.
 
 ## Planning
 
@@ -83,6 +109,77 @@ Append to a file in `data/methods/` and run `wowgold methods check`:
   class_modifiers: {druid: 1.15}
   risk: [pvp, competition]
 ```
+
+## Discovering new farms
+
+`wowgold discover` looks for farms nobody has written down yet. It reads the
+[VMaNGOS](https://github.com/vmangos/core) vanilla 1.12 world database (GPL-2.0, ~140 MB;
+`wowgold vanilla fetch` downloads it into `data/vanilla/`) and prices what it finds at current
+AH prices:
+
+- **Mob camps.** Each hostile mob gets an expected value per kill: loot table × price, plus
+  coins. Spawns are grouped into ~450-yard squares; in each, you kill the most valuable mobs
+  first, limited by your kill speed (40/h at even level, faster when you out-level them) and
+  by respawn times. The best squares become candidates, with a skinning variant when the mobs
+  are skinnable.
+- **Gathering loops.** Per zone and profession, node pools tell how many herbs/veins are up at
+  once. Their spacing gives travel time per node, capped by each node type's respawn rate.
+
+Candidates are ordinary methods with `confidence: hypothesis`, scored by the same planner
+(AH cut, demand caps, mount and gear modifiers). Zones are inferred from node pools and quest
+objectives, so they're approximate.
+
+Kill speed depends on your class (`CLASS_KILL_SPEED` in `discovery/discover.py`: hunters
+and warlocks fastest, priests slowest), mages get an AoE bonus on mobs 5+ levels below them,
+and rogues add pickpocket loot from humanoids.
+
+```bash
+wowgold discover                         # uses your saved profile
+wowgold discover -l 45 -p skinning:225 --kind farm --top 20
+wowgold discover --levels 20-60          # best farms at 20, 25, ..., 60 while leveling
+wowgold discover --levels 15,30,45 --per-level 5
+wowgold discover --write                 # also writes data/discovered/hypotheses.yaml
+```
+
+A `--levels` sweep keeps your class, faction and professions, and assumes profession skill
+keeps pace with level: 5 points per level, never above what `--prof` says. Below 60 it also
+assumes leveling gear and no epic mount.
+
+To test one, copy its entry from `data/discovered/hypotheses.yaml` into a file in
+`data/methods/`, play it with the addon running (or `wowgold session start <id>`), and import
+the session. Calibration then replaces the guessed yields with measured ones.
+
+**What it can't know:** vanilla drop rates, spawns and respawn times may differ in Forever, and
+Forever-only items (Scarce materials, new recipes) aren't in the data. White/grey weapons and
+armor and soulbound items are valued at vendor price only, which also hides troll listings.
+Fishing, pickpocketing and dungeons aren't covered yet.
+
+### Adding Forever-only items from Wowhead
+
+Forever-only items (Fel Crystal, Torbernite, Scarce materials, ...) aren't in the vanilla data,
+so `discover` can't see where they drop. You can look them up on Wowhead yourself and let
+wowgold save what the page shows:
+
+1. `wowgold ui`, then open http://127.0.0.1:8765/capture — a list of the most valuable
+   Forever-only items on your AH, linked to Wowhead.
+2. Install the userscript linked on that page in Tampermonkey or Violentmonkey (once).
+3. Click through the items. On each Wowhead page you open, the userscript reads the "Dropped by",
+   "Skinned from", "Mined from"... tables and posts them to the local server
+   (a green "wowgold: saved" badge confirms it). Pages are stored in `data/wowhead/captures/`.
+
+Nothing is fetched automatically: only pages you open are saved, at your browsing pace. The
+data is Wowhead's; keep it for personal use (it's gitignored) and don't redistribute it.
+
+`discover` then adds each drop chance to the matching vanilla mob or node, so a mob that now
+drops Fel Crystal can surface as a new camp.
+
+Sources without open-world spawn points in the vanilla data (NPCs new in Forever, or mobs that
+only live inside dungeons) become **leads**, listed under the farms. A lead is filtered like a
+farm: hostile to your faction, at most 2 levels above you, your class (pickpocketing is
+rogue-only), your skinning/gathering skill, and elites only with `--elites` (dungeon bosses
+never). Its "if plentiful" value counts only the captured items at your full kill speed, since
+there's no respawn data. Treat it as "worth a look", then measure it. `--leads N` sets how many
+to show; a `--levels` sweep shows the best lead per level.
 
 ## Measuring real yields
 

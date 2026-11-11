@@ -247,6 +247,8 @@ def evaluate(
             )
         elif method.confidence == "estimate":
             ev.flags.append("yields are estimates (not yet measured in Forever)")
+        elif method.confidence == "hypothesis":
+            ev.flags.append("hypothesis from vanilla data: test it in game before relying on it")
     if any(not book.get(i).absorb_measured for i in method.item_ids if book.get(i).market):
         ev.flags.append("demand estimated from listings (no sales history yet)")
     return ev

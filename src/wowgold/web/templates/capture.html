@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% block title %}Capture · wowgold{% endblock %}
+{% block head %}
+<style>
+  .bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 16px 0 8px; }
+  ol { padding-left: 20px; color: var(--muted); max-width: 760px; }
+  .st { width: 24px; color: var(--ok); font-weight: 700; }
+  tr.done a { color: var(--muted); }
+  tr.skipped td:not(:last-child) { opacity: .4; text-decoration: line-through; }
+  .skip { padding: 2px 8px; font-size: 12px; color: var(--muted); }
+  #hint:empty { display: none; }
+</style>
+{% endblock %}
+{% block main %}
+<h1>Wowhead capture</h1>
+<ol>
+  <li>Install the <a href="/wowgold-capture.user.js">userscript</a> in Tampermonkey or Violentmonkey (once). It only runs on Wowhead Forever item, NPC and object pages, and only sends to this app.</li>
+  <li>Open the items below. A green "wowgold: saved" badge on the Wowhead page means it was captured. Captures feed the <a href="/farms">Farms</a> page right away.</li>
+  <li>Skip anything crafted (bags, blueprints, bars, dyes): only drops and gathered items help.</li>
+</ol>
+{% if not vanilla %}<div class="note warn">No vanilla database (<code>wowgold vanilla fetch</code>), so this lists all items, not just Forever-only ones.</div>{% endif %}
+<div class="bar">
+  <button id="open" class="primary">Open next 10 in new tabs</button>
+  <span id="progress" class="muted"></span>
+</div>
+<p id="hint" class="note warn small"></p>
+<div class="panel scroll" style="padding:0">
+<table>
+  <thead><tr><th></th><th>Item ({{ targets | length }} most valuable {{ "Forever-only" if vanilla }})</th>
+    <th class="num">Market</th><th class="num">Listed</th><th></th></tr></thead>
+  <tbody>
+  {% for t in targets %}
+  <tr data-key="item-{{ t.item_id }}">
+    <td class="st"></td>
+    <td><a href="{{ t.url }}" target="_blank" rel="noopener">{{ t.name }}</a></td>
+    <td class="num">{{ t.market | gold }}</td>
+    <td class="num">{{ "{:,}".format(t.listed) }}</td>
+    <td><button class="skip" type="button">skip</button></td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="muted">No auction data yet: run <code>wowgold collect --once</code>.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+<script>
+const BATCH = 10, GAP_MS = 800;  // tabs per click, and a pause between them
+let done = {{ done | tojson }}, opened = new Set(), skipped = new Set();
+try { skipped = new Set(JSON.parse(localStorage.getItem("wowgold-skip") || "[]")); } catch (e) {}
+
+function saveSkips() {
+  try { localStorage.setItem("wowgold-skip", JSON.stringify([...skipped])); } catch (e) {}
+}
+function rows() { return [...document.querySelectorAll("tr[data-key]")]; }
+function pending() {
+  return rows().filter((tr) => !(tr.dataset.key in done) && !skipped.has(tr.dataset.key)
+                               && !opened.has(tr.dataset.key));
+}
+function render() {
+  let n = 0;
+  for (const tr of rows()) {
+    const ok = tr.dataset.key in done;
+    tr.classList.toggle("done", ok);
+    tr.classList.toggle("skipped", skipped.has(tr.dataset.key));
+    tr.querySelector(".st").textContent = ok ? "✓" : "";
+    tr.querySelector(".skip").textContent = skipped.has(tr.dataset.key) ? "unskip" : "skip";
+    n += ok;
+  }
+  document.getElementById("progress").textContent = n + " of " + rows().length + " captured";
+  const left = pending().length, btn = document.getElementById("open");
+  btn.disabled = left === 0;
+  btn.textContent = left === 0 ? "Nothing left to open"
+    : "Open next " + Math.min(BATCH, left) + " in new tabs";
+}
+document.getElementById("open").addEventListener("click", () => {
+  const hint = document.getElementById("hint");
+  hint.textContent = "";
+  pending().slice(0, BATCH).forEach((tr, i) => {
+    setTimeout(() => {
+      const win = window.open(tr.querySelector("a").href, "_blank");
+      if (!win) {  // blocked: browsers allow one pop-up per click unless the site is allowed
+        hint.textContent = "Your browser blocked some tabs. Allow pop-ups for this page " +
+          "(icon at the right of the address bar), then click again.";
+        return;
+      }
+      win.opener = null;
+      opened.add(tr.dataset.key);
+      render();
+    }, i * GAP_MS);
+  });
+});
+document.querySelector("tbody").addEventListener("click", (e) => {
+  if (!e.target.classList.contains("skip")) return;
+  const key = e.target.closest("tr").dataset.key;
+  skipped.has(key) ? skipped.delete(key) : skipped.add(key);
+  saveSkips();
+  render();
+});
+async function refresh() {
+  try { done = await (await fetch("/capture/status")).json(); } catch (e) {}
+  render();
+}
+render(); setInterval(refresh, 2000);
+</script>
+{% endblock %}

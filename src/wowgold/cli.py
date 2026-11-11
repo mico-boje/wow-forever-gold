@@ -18,7 +18,7 @@ from .methods.calibration import apply_calibration, calibrate, load_session_tota
 from .methods.check import check_items, missing_item_ids
 from .methods.models import GearTier, load_methods
 from .planner.engine import PlanOptions, make_plan, upgrade_targets
-from .planner.pricing import build_price_book
+from .planner.pricing import build_price_book, pick_houses
 from .planner.profile import CharacterProfile, parse_professions
 from .probe import Prober, save_report
 from .segments import (
@@ -61,6 +61,14 @@ segments_app = typer.Typer(
     help="Review activity the addon recorded and match it to methods.", no_args_is_help=True
 )
 app.add_typer(segments_app, name="segments")
+vanilla_app = typer.Typer(
+    help="Vanilla world database (VMaNGOS) used by `discover`.", no_args_is_help=True
+)
+app.add_typer(vanilla_app, name="vanilla")
+capture_app = typer.Typer(
+    help="Save Wowhead pages you open in your browser (personal use).", no_args_is_help=True
+)
+app.add_typer(capture_app, name="capture")
 session_app = typer.Typer(
     help="Log play sessions to measure real yields per method.", no_args_is_help=True
 )
@@ -471,19 +479,7 @@ def _gold(copper: float | None) -> str:
 
 
 def _pick_houses(conn, region: str, faction: str, explicit: list[int] | None, s: Settings):
-    if explicit:
-        return explicit
-    if s.wowgold_houses:
-        return s.wowgold_houses
-    candidates = [
-        r
-        for r in db.list_houses(conn, region)
-        if r["faction"] == faction and (r["last_auctions"] or r["last_commodities"])
-    ]
-    if not candidates:
-        return []
-    best = max(candidates, key=lambda r: (r["last_auctions"] or 0) + (r["last_commodities"] or 0))
-    return [best["house_id"]]
+    return pick_houses(conn, region, faction, explicit, s.wowgold_houses)
 
 
 @app.command()
@@ -1250,3 +1246,355 @@ def segments_draft(
 
 if __name__ == "__main__":
     app()
+
+
+@vanilla_app.command("fetch")
+def vanilla_fetch() -> None:
+    """Download the VMaNGOS world database (SQLite, ~140 MB, GPL-2.0) into data/vanilla/."""
+    from .discovery import vanilla
+
+    s = get_settings()
+    with console.status("Downloading VMaNGOS world database..."):
+        path, name = vanilla.fetch(s.wowgold_data_dir)
+    console.print(f"[green]Installed[/] {name} -> {path}")
+
+
+@app.command()
+def discover(
+    cls: ClassOpt = None,
+    level: LevelOpt = None,
+    faction: FactionOpt = None,
+    prof: ProfOpt = None,
+    gear: GearOpt = None,
+    epic_mount: EpicOpt = None,
+    kind: Annotated[str, typer.Option(help="What to look for: all | farm | gather.")] = "all",
+    elites: Annotated[bool, typer.Option(help="Include elite mobs.")] = False,
+    hours: Annotated[float, typer.Option(help="Length of the play session.")] = 2.0,
+    sell_days: Annotated[float, typer.Option(help="Days you're willing to wait to sell.")] = 3.0,
+    share: Annotated[
+        float, typer.Option(help="Share of daily demand you expect to capture (0-1).")
+    ] = 0.5,
+    house: Annotated[list[int] | None, typer.Option("--house", "-h", help="House ID(s).")] = None,
+    top: Annotated[int, typer.Option(help="How many hypotheses to list.")] = 15,
+    details: Annotated[int, typer.Option(help="Show evidence for the top N.")] = 3,
+    levels: Annotated[
+        str | None,
+        typer.Option(help="Leveling sweep: best farms per level, e.g. 20-60 or 15,30,45."),
+    ] = None,
+    step: Annotated[int, typer.Option(help="Level step for a --levels range.")] = 5,
+    per_level: Annotated[int, typer.Option(help="Farms to show per level in a sweep.")] = 3,
+    leads: Annotated[
+        int, typer.Option(help="Leads to show: captured Forever-only sources without spawn data.")
+    ] = 8,
+    write: Annotated[
+        bool, typer.Option(help="Write the listed hypotheses to data/discovered/hypotheses.yaml.")
+    ] = False,
+    region: RegionOpt = None,
+) -> None:
+    """Find farm hypotheses: vanilla loot and spawn data, priced at current AH prices.
+
+    Ranks for your class (kill speed, mage AoE, rogue pickpocketing), level, faction and
+    professions. With --levels, shows the best farms at each level while leveling, assuming
+    profession skill keeps pace with level (5 per level, capped at what --prof says).
+
+    Mob camps and gathering zones are generated from the VMaNGOS world DB (`wowgold vanilla
+    fetch`), then scored like curated methods. Rates are rough guesses: test the promising
+    ones in game, then record sessions to measure them."""
+
+    from .discovery.discover import parse_levels, to_yaml_entries
+    from .discovery.service import VanillaCache, run_discover
+
+    if kind not in ("all", "farm", "gather"):
+        raise typer.BadParameter("--kind must be all, farm or gather")
+    try:
+        sweep_levels = parse_levels(levels, step) if levels else None
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    s = get_settings()
+    region = region or s.wowgold_region
+    if sweep_levels and level is None and not load_profile(s.profile_path):
+        level = sweep_levels[-1]
+    profile = _resolve_profile(s, cls, level, faction, prof, gear, epic_mount)
+    opts = PlanOptions(hours=hours, sell_days=sell_days, market_share=share)
+    conn = db.connect(s.db_path)
+    try:
+        with console.status("Scoring camps, gathering zones and leads..."):
+            res = run_discover(
+                VanillaCache(s.wowgold_data_dir),
+                conn,
+                profile,
+                opts,
+                region=region,
+                house=house,
+                configured_houses=s.wowgold_houses,
+                kind=kind,
+                elites=elites,
+                levels=sweep_levels,
+                top=per_level if sweep_levels else top,
+                leads=1 if sweep_levels else leads,
+            )
+    except (FileNotFoundError, LookupError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+    finally:
+        conn.close()
+
+    if res.sweep:
+        _print_sweep(
+            profile,
+            res.house_ids,
+            [(r.profile, r.farms) for r in res.results],
+            per_level,
+            res.placed,
+            res.unplaced,
+        )
+        best_leads = [(r.profile.level, r.leads[0]) for r in res.results if r.leads]
+        if leads and best_leads:
+            _print_leads(
+                [lead for _, lead in best_leads],
+                "Best lead per level",
+                levels=[lvl for lvl, _ in best_leads],
+            )
+        if write:
+            chosen, seen = [], set()
+            for r in res.results:
+                for c in r.farms:
+                    if c.method.id not in seen:
+                        seen.add(c.method.id)
+                        chosen.append(c)
+            _write_hypotheses(s, chosen, to_yaml_entries)
+        return
+
+    ranked, found_leads = res.results[0].farms, res.results[0].leads
+    console.print(
+        f"[bold]Hypotheses for {_describe(profile)}[/] · house {', '.join(map(str, res.house_ids))}"
+    )
+    if res.placed or res.unplaced:
+        console.print(
+            f"Wowhead captures: {len(res.placed)} item source(s) added to vanilla mobs/nodes, "
+            f"{len(res.unplaced)} without open-world spawns (shown as leads)."
+        )
+    console.print(
+        "[yellow]From vanilla 1.12 data: drop rates, spawns and respawns may differ in Forever, "
+        "and Forever-only items are missing. Kill and gather rates are rough guesses.[/]"
+    )
+    table = Table(title="Farms worth testing", title_justify="left")
+    for col, just in (
+        ("#", "right"),
+        ("hypothesis", "left"),
+        ("needs", "left"),
+        ("gold/h", "right"),
+        ("range", "right"),
+        ("best items", "left"),
+    ):
+        table.add_column(col, justify=just)
+    for n, c in enumerate(ranked, start=1):
+        ev, m = c.evaluation, c.method
+        best = sorted((ln for ln in ev.lines if ln.item_id), key=lambda ln: -ln.value)[:3]
+        table.add_row(
+            str(n),
+            f"{m.name}\n[dim]{m.zone} · {m.id}[/]",
+            _needs(m),
+            _gold(ev.gold_per_hour),
+            f"{_gold(ev.low)}-{_gold(ev.high)}",
+            ", ".join(ln.name for ln in best),
+        )
+    console.print(table)
+    for c in ranked[:details]:
+        console.print(f"\n[bold]{c.method.name}[/] — {c.method.description}")
+        for line in c.evidence[:6]:
+            console.print(f"  [dim]•[/] {line}")
+        for ln in sorted(c.evaluation.lines, key=lambda ln: -ln.value)[:6]:
+            label = (
+                "coins + vendor trash" if ln.item_id == 0 else f"{ln.produced:>5.0f} × {ln.name}"
+            )
+            console.print(f"    {label:<34} {_gold(ln.value):>8}")
+    if leads and found_leads:
+        _print_leads(found_leads, "Leads: Forever-only sources from your Wowhead captures")
+    elif leads and not elites and res.hidden_elite_leads:
+        console.print(
+            f"\n[dim]{res.hidden_elite_leads} captured source(s) without open-world spawns are "
+            "elite (mostly dungeon mobs): add --elites to list them as leads.[/]"
+        )
+    if write:
+        _write_hypotheses(s, ranked, to_yaml_entries)
+
+
+def _print_leads(found, title: str, levels: list[int] | None = None) -> None:
+    console.print()
+    table = Table(title=title, title_justify="left")
+    cols = [("level", "right")] if levels else []
+    cols += [
+        ("source", "left"),
+        ("zone", "left"),
+        ("drops (chance, samples)", "left"),
+        ("if plentiful", "right"),
+        ("notes", "left"),
+    ]
+    for col, just in cols:
+        table.add_column(col, justify=just)
+    for n, lead in enumerate(found):
+        src = lead.source
+        lvl = f"lvl {src.level[0]}-{src.level[1]}" if src.level else ""
+        what = {"drop": "kill", "skinning": "skin", "pickpocket": "pickpocket"}.get(
+            lead.kind, lead.kind
+        )
+        drops = "\n".join(
+            f"{i.name} {i.chance:.1%}" + (f" (n={i.samples})" if i.samples else "")
+            for i in lead.items[:3]
+        )
+        row = [str(levels[n])] if levels else []
+        row += [
+            f"{src.source_name}\n[dim]{what} · {src.source_type} {src.source_id} {lvl}[/]",
+            ", ".join(lead.zones[:2]) or "?",
+            drops,
+            f"{_gold(lead.gold_per_hour)}/h",
+            ", ".join(lead.flags),
+        ]
+        table.add_row(*row)
+    console.print(table)
+    console.print(
+        "[dim]No spawn data for these: 'if plentiful' assumes you can keep killing (or "
+        "gathering) at full speed and counts only the captured items. Check numbers and "
+        "competition in game; Wowhead chances with few samples are noisy.[/]"
+    )
+
+
+def _needs(m) -> str:
+    req = m.requirements
+    return ", ".join(
+        [f"lvl {req.level}"]
+        + [f"{p} {v}" for p, v in req.professions.items()]
+        + (["elites"] if "elite_mobs" in m.risk else [])
+    )
+
+
+def _write_hypotheses(s: Settings, cands, to_yaml_entries) -> None:
+    import yaml
+
+    if not cands:
+        return
+    out = s.wowgold_data_dir / "discovered" / "hypotheses.yaml"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        "# Generated by `wowgold discover`. Copy the ones you want to test into\n"
+        "# data/methods/ (e.g. data/methods/hypotheses.yaml), then record sessions.\n"
+        + yaml.safe_dump(to_yaml_entries(cands), sort_keys=False, allow_unicode=True)
+    )
+    console.print(f"\n[green]Wrote {len(cands)} hypotheses[/] to {out}")
+
+
+def _print_sweep(profile, house_ids, results, per_level, placed, unplaced) -> None:
+    profs = ", ".join(f"{p} {v}" for p, v in profile.professions.items()) or "no professions"
+    console.print(
+        f"[bold]Leveling sweep: {profile.faction} {profile.cls}[/] ({profs} at most; skill "
+        f"assumed to keep pace with level) · house {', '.join(map(str, house_ids))}"
+    )
+    if placed or unplaced:
+        console.print(f"Wowhead captures: {len(placed)} item source(s) used.")
+    console.print(
+        "[yellow]Vanilla data at today's prices: rates are rough guesses, and prices will move "
+        "as the server ages.[/]"
+    )
+    table = Table(title="Best farms by level", title_justify="left")
+    for col, just in (
+        ("level", "right"),
+        ("#", "right"),
+        ("hypothesis", "left"),
+        ("needs", "left"),
+        ("gold/h", "right"),
+        ("best items", "left"),
+    ):
+        table.add_column(col, justify=just)
+    for at, ranked in results:
+        if not ranked:
+            table.add_row(str(at.level), "", "[dim]nothing found[/]", "", "", "", end_section=True)
+            continue
+        shown = ranked[:per_level]
+        for n, c in enumerate(shown, start=1):
+            ev = c.evaluation
+            best = sorted((ln for ln in ev.lines if ln.item_id), key=lambda ln: -ln.value)[:3]
+            table.add_row(
+                str(at.level) if n == 1 else "",
+                str(n),
+                f"{c.method.name}\n[dim]{c.method.zone} · {c.method.id}[/]",
+                _needs(c.method),
+                _gold(ev.gold_per_hour),
+                ", ".join(ln.name for ln in best),
+                end_section=n == len(shown),
+            )
+    console.print(table)
+
+
+def _serve_ui(port: int, path: str = "/") -> None:
+    import uvicorn
+
+    from .web.app import create_app
+
+    url = f"http://127.0.0.1:{port}{path}"
+    console.print(f"wowgold UI on [bold]{url}[/]  (Ctrl+C to stop)")
+    console.print(f"[dim]Wowhead userscript: http://127.0.0.1:{port}/wowgold-capture.user.js[/]")
+    uvicorn.run(create_app(), host="127.0.0.1", port=port, log_level="warning")
+
+
+@app.command()
+def ui(port: Annotated[int, typer.Option(help="Local port.")] = 8765) -> None:
+    """Open the local web UI: farms, leveling sweep, leads, Wowhead capture, collector status.
+
+    Listens on 127.0.0.1 only. On WSL, open the printed address in your Windows browser."""
+    _serve_ui(port)
+
+
+@capture_app.command("serve")
+def capture_serve(port: Annotated[int, typer.Option(help="Local port.")] = 8765) -> None:
+    """Start the web UI on its Capture page (same as `wowgold ui`)."""
+    _serve_ui(port, "/capture")
+
+
+@capture_app.command("sources")
+def capture_sources() -> None:
+    """Show item sources parsed from your Wowhead captures, and whether discover can use them."""
+    from .discovery import vanilla
+    from .discovery.discover import VanillaData
+    from .wowhead.sources import load_sources
+
+    s = get_settings()
+    sources = load_sources(s.wowgold_data_dir)
+    if not sources:
+        console.print("No sources captured yet. Run `wowgold capture serve`.")
+        return
+    placed_ids: set[tuple] = set()
+    try:
+        vconn = vanilla.connect(vanilla.db_path(s.wowgold_data_dir))
+        data = VanillaData.load(vconn)
+        placed, _ = data.add_sources(sources)
+        placed_ids = {(p.item_id, p.kind, p.source_id) for p in placed}
+        vconn.close()
+    except FileNotFoundError:
+        pass
+    conn = db.connect(s.db_path)
+    try:
+        names = {r[0]: r[1] for r in conn.execute("SELECT item_id, name FROM items")}
+    finally:
+        conn.close()
+    table = Table(title="Captured item sources", title_justify="left")
+    for col, just in (
+        ("item", "left"),
+        ("how", "left"),
+        ("source", "left"),
+        ("chance", "right"),
+        ("samples", "right"),
+        ("used by discover", "left"),
+    ):
+        table.add_column(col, justify=just)
+    for src in sorted(sources, key=lambda x: (x.item_id, -(x.chance or 0))):
+        used = (src.item_id, src.kind, src.source_id) in placed_ids
+        table.add_row(
+            names.get(src.item_id) or str(src.item_id),
+            src.kind,
+            f"{src.source_name} [dim]{src.source_type} {src.source_id}[/]",
+            f"{src.chance:.1%}" if src.chance is not None else "-",
+            f"{src.samples:,}" if src.samples else "-",
+            "camp" if used else "[dim]lead (no open-world spawns)[/]",
+        )
+    console.print(table)

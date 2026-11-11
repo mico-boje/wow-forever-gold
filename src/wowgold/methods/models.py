@@ -38,6 +38,7 @@ class Confidence(StrEnum):
     ESTIMATE = "estimate"  # educated guess (usually from Classic Era experience)
     COMMUNITY = "community"  # reported by Forever players
     MEASURED = "measured"  # calibrated from our own session logs
+    HYPOTHESIS = "hypothesis"  # generated from vanilla data by `wowgold discover`; untested
 
 
 class Faction(StrEnum):

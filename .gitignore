@@ -28,3 +28,14 @@ data/active_session.json
 .idea/
 .vscode/
 *.swp
+
+# Collector cron output
+data/collect.log
+data/collect.lock
+
+# Vanilla world database (VMaNGOS, GPL-2.0) — downloaded by `wowgold vanilla fetch`
+data/vanilla/
+# Generated farm hypotheses
+data/discovered/
+# Wowhead pages you captured in your browser (personal use, not for redistribution)
+data/wowhead/
