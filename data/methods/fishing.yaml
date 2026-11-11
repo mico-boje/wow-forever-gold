@@ -1,0 +1,22 @@
+# Fishing pools/open water. Yields per hour.
+
+- id: fishing_oily_blackmouth
+  name: Oily Blackmouth and Firefin Snapper pools (Barrens / Westfall coast)
+  kind: fishing
+  zone: The Barrens
+  zones: ["The Barrens", "Westfall", "Darkshore"]
+  requirements: {level: 20, professions: {fishing: 100}}
+  yields:
+    - {item: 6358, name: Oily Blackmouth, qty: 45, sd: 15}
+    - {item: 6359, name: Firefin Snapper, qty: 25, sd: 10}
+  risk: [competition]
+
+- id: fishing_stonescale_eel
+  name: Stonescale Eel schools (Feralas / Azshara)
+  kind: fishing
+  zone: Feralas
+  zones: ["Feralas", "Azshara"]
+  requirements: {level: 45, professions: {fishing: 225}}
+  yields:
+    - {item: 13422, name: Stonescale Eel, qty: 35, sd: 12}
+  risk: [competition]

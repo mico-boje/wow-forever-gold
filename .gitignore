@@ -1,0 +1,30 @@
+# Python / tooling
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local data (downloaded snapshots, database, personal state)
+data/raw/
+data/probes/
+data/*.sqlite3
+data/*.sqlite3-*
+data/profile.json
+data/active_session.json
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp

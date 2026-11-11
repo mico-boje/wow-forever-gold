@@ -1,0 +1,85 @@
+# Crafts. Reagent/output quantities are per craft. Reagents marked `vendor: true` are
+# priced at the vendor's buy price; everything else at the AH market price (buying it,
+# or the opportunity cost of not selling what you gathered yourself).
+# Forever added 600+ new recipes; these are the vanilla staples until we map new ones (TODO).
+
+- id: craft_major_healing_potion
+  name: Major Healing Potion
+  kind: craft
+  requirements: {level: 40, professions: {alchemy: 275}}
+  reagents:
+    - {item: 13464, name: Golden Sansam, qty: 2}
+    - {item: 13465, name: Mountain Silversage, qty: 1}
+    - {item: 8925, name: Crystal Vial, qty: 1, vendor: true}
+  outputs:
+    - {item: 13446, name: Major Healing Potion, qty: 1}
+
+- id: craft_major_mana_potion
+  name: Major Mana Potion
+  kind: craft
+  requirements: {level: 40, professions: {alchemy: 295}}
+  reagents:
+    - {item: 13463, name: Dreamfoil, qty: 3}
+    - {item: 13467, name: Icecap, qty: 2}
+    - {item: 8925, name: Crystal Vial, qty: 1, vendor: true}
+  outputs:
+    - {item: 13444, name: Major Mana Potion, qty: 1}
+
+- id: craft_elixir_of_the_mongoose
+  name: Elixir of the Mongoose
+  kind: craft
+  requirements: {level: 40, professions: {alchemy: 280}}
+  reagents:
+    - {item: 13465, name: Mountain Silversage, qty: 2}
+    - {item: 13466, name: Plaguebloom, qty: 2}
+    - {item: 8925, name: Crystal Vial, qty: 1, vendor: true}
+  outputs:
+    - {item: 13452, name: Elixir of the Mongoose, qty: 1}
+
+- id: craft_greater_fire_protection
+  name: Greater Fire Protection Potion
+  kind: craft
+  requirements: {level: 40, professions: {alchemy: 290}}
+  reagents:
+    - {item: 7078, name: Essence of Fire, qty: 1}
+    - {item: 13463, name: Dreamfoil, qty: 1}
+    - {item: 8925, name: Crystal Vial, qty: 1, vendor: true}
+  outputs:
+    - {item: 13457, name: Greater Fire Protection Potion, qty: 1}
+  notes: Recipe drops in Blackrock Spire.
+
+- id: craft_bolt_of_runecloth
+  name: Bolt of Runecloth
+  kind: craft
+  requirements: {level: 1, professions: {tailoring: 250}}
+  reagents:
+    - {item: 14047, name: Runecloth, qty: 4}
+  outputs:
+    - {item: 14048, name: Bolt of Runecloth, qty: 1}
+
+- id: craft_heavy_runecloth_bandage
+  name: Heavy Runecloth Bandage
+  kind: craft
+  requirements: {level: 1, professions: {first_aid: 290}}
+  reagents:
+    - {item: 14047, name: Runecloth, qty: 2}
+  outputs:
+    - {item: 14530, name: Heavy Runecloth Bandage, qty: 1}
+
+- id: craft_thorium_bar
+  name: Smelt Thorium Bar
+  kind: craft
+  requirements: {level: 1, professions: {mining: 250}}
+  reagents:
+    - {item: 10620, name: Thorium Ore, qty: 1}
+  outputs:
+    - {item: 12359, name: Thorium Bar, qty: 1}
+
+- id: craft_mithril_bar
+  name: Smelt Mithril Bar
+  kind: craft
+  requirements: {level: 1, professions: {mining: 175}}
+  reagents:
+    - {item: 3858, name: Mithril Ore, qty: 1}
+  outputs:
+    - {item: 3860, name: Mithril Bar, qty: 1}

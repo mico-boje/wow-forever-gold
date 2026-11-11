@@ -1,0 +1,185 @@
+# Gathering routes. Yields are items per hour for a focused route with a normal mount,
+# estimated from Classic Era experience (confidence: estimate). Forever adds "Scarce"
+# materials to every node type; their item IDs are not known yet (TODO).
+# class_modifiers multiply yields: druids skip dismounting (travel/flight form), etc.
+
+# ---------------------------------------------------------------- herbalism
+
+- id: herb_barrens_low
+  name: Low-level herbs (Barrens / Silverpine)
+  kind: gather
+  zone: The Barrens
+  zones: ["The Barrens", "Silverpine Forest", "Darkshore", "Westfall"]
+  requirements: {level: 15, professions: {herbalism: 100}}
+  yields:
+    - {item: 2447, name: Peacebloom, qty: 10, sd: 4}
+    - {item: 765, name: Silverleaf, qty: 12, sd: 4}
+    - {item: 2449, name: Earthroot, qty: 6, sd: 3}
+    - {item: 785, name: Mageroyal, qty: 10, sd: 4}
+    - {item: 2450, name: Briarthorn, qty: 10, sd: 4}
+    - {item: 2453, name: Bruiseweed, qty: 6, sd: 3}
+  class_modifiers: {druid: 1.1}
+  risk: [competition]
+
+- id: herb_stranglethorn
+  name: Mid-level herbs (Stranglethorn Vale)
+  kind: gather
+  zone: Stranglethorn Vale
+  requirements: {level: 35, professions: {herbalism: 210}}
+  yields:
+    - {item: 3358, name: "Khadgar's Whisker", qty: 8, sd: 3}
+    - {item: 3357, name: Liferoot, qty: 6, sd: 3}
+    - {item: 3818, name: Fadeleaf, qty: 6, sd: 3}
+    - {item: 3821, name: Goldthorn, qty: 8, sd: 3}
+    - {item: 3356, name: Kingsblood, qty: 6, sd: 3}
+    - {item: 8831, name: Purple Lotus, qty: 5, sd: 2}
+  class_modifiers: {druid: 1.15}
+  risk: [pvp, competition]
+
+- id: herb_un_goro
+  name: "Un'Goro Crater herbs"
+  kind: gather
+  zone: "Un'Goro Crater"
+  requirements: {level: 48, professions: {herbalism: 270}}
+  yields:
+    - {item: 13463, name: Dreamfoil, qty: 14, sd: 5}
+    - {item: 13464, name: Golden Sansam, qty: 8, sd: 3}
+    - {item: 8838, name: Sungrass, qty: 10, sd: 4}
+    - {item: 8831, name: Purple Lotus, qty: 3, sd: 2}
+    - {item: 8836, name: "Arthas' Tears", qty: 2, sd: 1}
+  class_modifiers: {druid: 1.15}
+  risk: [competition, elite_mobs]
+
+- id: herb_felwood
+  name: Felwood herbs
+  kind: gather
+  zone: Felwood
+  requirements: {level: 52, professions: {herbalism: 285}}
+  yields:
+    - {item: 8846, name: Gromsblood, qty: 10, sd: 4}
+    - {item: 13463, name: Dreamfoil, qty: 8, sd: 3}
+    - {item: 13464, name: Golden Sansam, qty: 6, sd: 3}
+    - {item: 13465, name: Mountain Silversage, qty: 6, sd: 3}
+    - {item: 13466, name: Plaguebloom, qty: 8, sd: 3}
+  class_modifiers: {druid: 1.15}
+  risk: [pvp, competition]
+
+- id: herb_eastern_plaguelands
+  name: Eastern Plaguelands herbs (incl. Black Lotus)
+  kind: gather
+  zone: Eastern Plaguelands
+  requirements: {level: 55, professions: {herbalism: 300}}
+  yields:
+    - {item: 13466, name: Plaguebloom, qty: 12, sd: 4}
+    - {item: 13465, name: Mountain Silversage, qty: 8, sd: 3}
+    - {item: 13463, name: Dreamfoil, qty: 6, sd: 3}
+    - {item: 13464, name: Golden Sansam, qty: 5, sd: 2}
+    - {item: 8836, name: "Arthas' Tears", qty: 5, sd: 2}
+    - {item: 13468, name: Black Lotus, qty: 0.5, sd: 0.5}
+  class_modifiers: {druid: 1.15}
+  risk: [pvp, competition]
+
+# ---------------------------------------------------------------- mining
+
+- id: mining_iron_arathi
+  name: Iron and gold veins (Arathi Highlands / Desolace)
+  kind: gather
+  zone: Arathi Highlands
+  zones: ["Arathi Highlands", "Desolace"]
+  requirements: {level: 30, professions: {mining: 125}}
+  yields:
+    - {item: 2772, name: Iron Ore, qty: 30, sd: 10}
+    - {item: 2776, name: Gold Ore, qty: 3, sd: 2}
+    - {item: 2838, name: Heavy Stone, qty: 12, sd: 5}
+    - {item: 1529, name: Jade, qty: 0.6, sd: 0.5}
+    - {item: 3864, name: Citrine, qty: 0.6, sd: 0.5}
+  class_modifiers: {druid: 1.1}
+  risk: [competition]
+
+- id: mining_mithril_tanaris
+  name: Mithril and truesilver veins (Tanaris / Badlands)
+  kind: gather
+  zone: Tanaris
+  zones: ["Tanaris", "Badlands"]
+  requirements: {level: 42, professions: {mining: 175}}
+  yields:
+    - {item: 3858, name: Mithril Ore, qty: 32, sd: 10}
+    - {item: 7911, name: Truesilver Ore, qty: 4, sd: 2}
+    - {item: 2776, name: Gold Ore, qty: 2, sd: 1.5}
+    - {item: 7912, name: Solid Stone, qty: 12, sd: 5}
+    - {item: 7909, name: Aquamarine, qty: 0.8, sd: 0.6}
+    - {item: 7910, name: Star Ruby, qty: 0.6, sd: 0.5}
+  class_modifiers: {druid: 1.1}
+  risk: [competition]
+
+- id: mining_thorium_un_goro
+  name: Small thorium veins (Un'Goro Crater)
+  kind: gather
+  zone: "Un'Goro Crater"
+  requirements: {level: 48, professions: {mining: 245}}
+  yields:
+    - {item: 10620, name: Thorium Ore, qty: 32, sd: 10}
+    - {item: 12365, name: Dense Stone, qty: 10, sd: 4}
+    - {item: 7910, name: Star Ruby, qty: 0.6, sd: 0.5}
+    - {item: 12361, name: Blue Sapphire, qty: 0.4, sd: 0.4}
+    - {item: 12799, name: Large Opal, qty: 0.4, sd: 0.4}
+  class_modifiers: {druid: 1.1}
+  risk: [competition, elite_mobs]
+
+- id: mining_rich_thorium_winterspring
+  name: Rich thorium veins (Winterspring / Eastern Plaguelands)
+  kind: gather
+  zone: Winterspring
+  zones: ["Winterspring", "Eastern Plaguelands"]
+  requirements: {level: 55, professions: {mining: 275}}
+  yields:
+    - {item: 10620, name: Thorium Ore, qty: 45, sd: 15}
+    - {item: 12365, name: Dense Stone, qty: 14, sd: 5}
+    - {item: 12363, name: Arcane Crystal, qty: 1.0, sd: 0.8}
+    - {item: 12800, name: Azerothian Diamond, qty: 0.4, sd: 0.4}
+    - {item: 12364, name: Huge Emerald, qty: 0.4, sd: 0.4}
+    - {item: 12361, name: Blue Sapphire, qty: 0.5, sd: 0.4}
+  class_modifiers: {druid: 1.1}
+  risk: [competition]
+
+# ---------------------------------------------------------------- skinning
+
+- id: skinning_feralas
+  name: Skinning beasts in Feralas (thick leather)
+  kind: gather
+  zone: Feralas
+  requirements: {level: 42, professions: {skinning: 200}}
+  yields:
+    - {item: 4304, name: Thick Leather, qty: 45, sd: 12}
+    - {item: 8169, name: Thick Hide, qty: 1.5, sd: 1}
+  vendor_copper_per_hour: 20000
+  class_modifiers: {hunter: 1.2, warlock: 1.1, rogue: 0.95, priest: 0.85, warrior: 0.9}
+  risk: [competition]
+
+- id: skinning_winterspring
+  name: Skinning beasts in Winterspring (rugged leather)
+  kind: gather
+  zone: Winterspring
+  requirements: {level: 55, professions: {skinning: 260}}
+  yields:
+    - {item: 8170, name: Rugged Leather, qty: 45, sd: 12}
+    - {item: 8171, name: Rugged Hide, qty: 1.5, sd: 1}
+  vendor_copper_per_hour: 40000
+  class_modifiers: {hunter: 1.2, warlock: 1.1, rogue: 0.95, priest: 0.85, warrior: 0.9}
+  risk: [competition]
+
+- id: skinning_devilsaur
+  name: Devilsaur hunting (Un'Goro Crater)
+  kind: gather
+  zone: "Un'Goro Crater"
+  description: Kill and skin the patrolling devilsaurs; heavily contested.
+  requirements:
+    level: 58
+    professions: {skinning: 300}
+    classes: [hunter, rogue, warlock, druid]
+    gear: fresh
+  yields:
+    - {item: 15417, name: Devilsaur Leather, qty: 5, sd: 3}
+    - {item: 8170, name: Rugged Leather, qty: 6, sd: 3}
+  class_modifiers: {hunter: 1.2}
+  risk: [pvp, competition]

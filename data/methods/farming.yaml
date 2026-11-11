@@ -1,0 +1,98 @@
+# Mob farming. Yields per hour for a solo player in appropriate gear.
+# vendor_copper_per_hour = coins + grey items sold to a vendor.
+# Forever nerfed mage AoE (Cone of Cold, Arcane Concentration, Improved Blizzard), so mage
+# AoE dungeon farms are left out and mages get no special bonus here.
+
+- id: farm_silk_arathi
+  name: Silk cloth (Arathi Highlands humanoids)
+  kind: farm
+  zone: Arathi Highlands
+  requirements: {level: 32}
+  yields:
+    - {item: 4306, name: Silk Cloth, qty: 60, sd: 20}
+  vendor_copper_per_hour: 25000
+  class_modifiers: &solo_farm {hunter: 1.15, warlock: 1.1, mage: 1.05, paladin: 0.9, priest: 0.85}
+
+- id: farm_mageweave_tanaris
+  name: Mageweave cloth (Tanaris Wastewander bandits)
+  kind: farm
+  zone: Tanaris
+  requirements: {level: 45}
+  yields:
+    - {item: 4338, name: Mageweave Cloth, qty: 55, sd: 18}
+  vendor_copper_per_hour: 45000
+  class_modifiers: *solo_farm
+  risk: [competition]
+
+- id: farm_runecloth_winterfall
+  name: Runecloth (Winterfall furbolgs, Winterspring)
+  kind: farm
+  zone: Winterspring
+  requirements: {level: 56, gear: fresh}
+  yields:
+    - {item: 14047, name: Runecloth, qty: 40, sd: 12}
+  vendor_copper_per_hour: 90000
+  class_modifiers: *solo_farm
+  risk: [competition]
+
+- id: farm_felcloth_jadefire
+  name: Runecloth and Felcloth (Jadefire satyrs, Felwood)
+  kind: farm
+  zone: Felwood
+  requirements: {level: 54, gear: fresh}
+  yields:
+    - {item: 14047, name: Runecloth, qty: 30, sd: 10}
+    - {item: 14256, name: Felcloth, qty: 2.5, sd: 1.5}
+  vendor_copper_per_hour: 80000
+  class_modifiers: *solo_farm
+  risk: [pvp, competition]
+
+- id: farm_undead_epl
+  name: Undead in Eastern Plaguelands (runecloth, essence of undeath)
+  kind: farm
+  zone: Eastern Plaguelands
+  requirements: {level: 56, gear: fresh}
+  yields:
+    - {item: 14047, name: Runecloth, qty: 30, sd: 10}
+    - {item: 12808, name: Essence of Undeath, qty: 4, sd: 2}
+  vendor_copper_per_hour: 90000
+  class_modifiers: {paladin: 1.15, priest: 1.0, hunter: 1.1, warlock: 1.1, mage: 1.05}
+
+- id: farm_fire_elementals_searing_gorge
+  name: Fire elementals (Searing Gorge / Burning Steppes)
+  kind: farm
+  zone: Searing Gorge
+  zones: ["Searing Gorge", "Burning Steppes"]
+  requirements: {level: 50}
+  yields:
+    - {item: 7077, name: Heart of Fire, qty: 18, sd: 6}
+    - {item: 7068, name: Elemental Fire, qty: 10, sd: 4}
+    - {item: 7078, name: Essence of Fire, qty: 2, sd: 1.5}
+  vendor_copper_per_hour: 30000
+  class_modifiers: {mage: 0.85, warlock: 1.0, hunter: 1.1}
+  notes: Fire-immune targets; mages and fire-spec casters are slower.
+
+- id: farm_water_elementals_azshara
+  name: Water elementals (Azshara / Silithus)
+  kind: farm
+  zone: Azshara
+  zones: ["Azshara", "Silithus"]
+  requirements: {level: 50}
+  yields:
+    - {item: 7079, name: Globe of Water, qty: 16, sd: 5}
+    - {item: 7070, name: Elemental Water, qty: 8, sd: 3}
+    - {item: 7080, name: Essence of Water, qty: 1.5, sd: 1}
+  vendor_copper_per_hour: 30000
+  class_modifiers: *solo_farm
+
+- id: farm_air_elementals_silithus
+  name: Dust stormers (Silithus)
+  kind: farm
+  zone: Silithus
+  requirements: {level: 55, gear: fresh}
+  yields:
+    - {item: 7081, name: Breath of Wind, qty: 18, sd: 6}
+    - {item: 7069, name: Elemental Air, qty: 6, sd: 3}
+    - {item: 7082, name: Essence of Air, qty: 1.5, sd: 1}
+  vendor_copper_per_hour: 30000
+  class_modifiers: *solo_farm

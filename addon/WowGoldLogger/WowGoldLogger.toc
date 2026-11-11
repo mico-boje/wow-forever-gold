@@ -1,0 +1,7 @@
+## Interface: 11507, 16001
+## Title: WowGold Logger
+## Notes: Records loot sources, kills and coins so the wowgold planner can measure real farming yields.
+## Version: 0.2.0
+## SavedVariables: WowGoldLoggerDB
+
+WowGoldLogger.lua
