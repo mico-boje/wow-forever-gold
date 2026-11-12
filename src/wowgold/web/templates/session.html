@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}Session · wowgold{% endblock %}
+{% block head %}
+<style>
+  .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin: 12px 0; }
+  .stat { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--panel); }
+  .stat .v { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .l { font-size: 12px; color: var(--muted); }
+  .slow { color: var(--bad); } .fast { color: var(--ok); }
+</style>
+{% endblock %}
+{% block main %}
+{% set r = d.rec %}
+<p class="small"><a href="/sessions">← Sessions</a></p>
+<h1>{{ r.note or "Session" }} <span class="muted" style="font-weight:400">· {{ r.started.strftime("%a %d %b %Y, %H:%M") }}</span></h1>
+<p class="muted">{{ r.char.get("name") or "?" }}{% if r.char.get("realm") %} ({{ r.char.get("realm") }}){% endif %}, level {{ r.level or "?" }} {{ (r.cls or "?") | capitalize }}, {{ (r.faction or "?") | capitalize }}
+  {%- if r.professions %} · {% for p, v in r.professions.items() %}{{ p }} {{ v }}{{ ", " if not loop.last }}{% endfor %}{% endif %}
+  {%- if r.stopped is none %} · <strong>still recording</strong> (this is up to the last /reload){% endif %}
+  {%- if r.ended == "stale" %} · finished on a later login{% endif %}</p>
+{% if not vanilla %}<div class="note warn small">The vanilla database is missing (<code>wowgold vanilla fetch</code>): no mob names, levels or model comparison.</div>{% endif %}
+
+<div class="stats">
+  <div class="stat"><div class="v">{{ d.gold_per_hour | gold if d.gold_per_hour is not none else "—" }}</div><div class="l">gold per active hour</div></div>
+  <div class="stat"><div class="v">{{ d.value | gold }}</div><div class="l">looted, at today's prices</div></div>
+  <div class="stat"><div class="v">{{ d.active_s | dur }}</div><div class="l">active, of {{ d.duration_s | dur }}{% if d.paused_s %} ({{ d.paused_s | dur }} paused){% endif %}</div></div>
+  <div class="stat"><div class="v">{{ d.kills }}</div><div class="l">kills{% if d.kills_per_hour is not none %}, {{ "%.0f" | format(d.kills_per_hour) }}/h{% endif %}</div></div>
+  <div class="stat"><div class="v {{ 'slow' if d.kill_speed and d.kill_speed < 0.9 else 'fast' if d.kill_speed and d.kill_speed > 1.1 }}">{{ "×%.2f" | format(d.kill_speed) if d.kill_speed is not none else "—" }}</div><div class="l">kill speed vs the model{% if speed %} (all {{ r.cls }} sessions: ×{{ "%.2f" | format(speed.factor) }}){% endif %}</div></div>
+  {% if d.expected_value %}<div class="stat"><div class="v">{{ "%.0f" | format(100 * d.value / d.expected_value) }}%</div><div class="l">of the loot the model expects for your kills ({{ d.expected_value | gold }})</div></div>{% endif %}
+  <div class="stat"><div class="v">{{ "%.0f" | format(100 * d.combat_s / d.active_s) if d.active_s else 0 }}%</div><div class="l">of active time in combat</div></div>
+  {% if d.xp %}<div class="stat"><div class="v">{{ "{:,}".format((d.xp / (d.active_s / 3600)) | round | int) if d.active_s >= 60 else d.xp }}</div><div class="l">XP per hour{% if d.levels %}, reached {{ d.levels | join(", ") }}{% endif %}</div></div>{% endif %}
+  {% if d.money_change is not none %}<div class="stat"><div class="v">{{ d.money_change | gold }}</div><div class="l">money change (incl. vendor sales, repairs)</div></div>{% endif %}
+  {% if d.deaths %}<div class="stat"><div class="v">{{ d.deaths }}</div><div class="l">deaths</div></div>{% endif %}
+</div>
+
+{% if d.zones %}<p class="small muted">Time by zone: {% for z, secs in d.zones %}{{ z }} {{ secs | dur }}{{ ", " if not loop.last }}{% endfor %}</p>{% endif %}
+
+{% if d.mobs %}
+<h2>Mobs</h2>
+<div class="panel scroll" style="padding:0"><table>
+  <thead><tr><th>Mob</th><th class="num">Kills</th><th class="num">Model kills/h</th><th class="num">Others' kills</th><th>Looted</th><th class="num">Value</th><th class="num">Model / kill</th><th class="num">Respawn</th></tr></thead>
+  {% for m in d.mobs %}
+  <tr>
+    <td><a href="https://www.wowhead.com/forever/npc={{ m.id }}" target="_blank" rel="noopener">{{ m.name }}</a>{% if m.level %} <span class="small muted">lvl {{ m.level[0] }}{% if m.level[1] != m.level[0] %}–{{ m.level[1] }}{% endif %}</span>{% endif %}</td>
+    <td class="num">{{ m.kills or "" }}</td>
+    <td class="num muted">{{ "%.0f" | format(m.model_rate) if m.model_rate else "" }}</td>
+    <td class="num">{% if m.others %}{{ m.others }} <span class="small muted">({{ "%.0f" | format(100 * m.competition) }}%)</span>{% endif %}</td>
+    <td class="small">{% for i, n in (m.items.items() | sort(attribute=1, reverse=True))[:4] %}{{ n }}× {{ book.get(i).name if book and book.get(i).name else "item %d" % i }}{{ ", " if not loop.last }}{% endfor %}{% if m.copper %}{{ " + " if m.items }}{{ m.copper | gold }}{% endif %}</td>
+    <td class="num">{{ m.value | gold if m.value else "" }}</td>
+    <td class="num muted">{{ (m.expected_per_kill * m.kills) | gold if m.expected_per_kill and m.kills else "" }}</td>
+    <td class="num">{% if m.respawn_s %}{{ m.respawn_s | dur }} <span class="small muted">(n={{ m.respawn_pairs }})</span>{% elif m.respawn_pairs %}<span class="small muted">{{ m.respawn_pairs }} re-kill{{ "s" if m.respawn_pairs > 1 }}</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table></div>
+<p class="small muted">Model kills/h: what wowgold assumes for your class and level against that mob, before calibration. Model / kill: the loot the vanilla/Wowhead tables expect for your kills, at today's prices. Respawn: re-killing the same mob at the same spot (lower quartile, once there are 3).</p>
+{% endif %}
+
+{% set others = d.sources | rejectattr('kind', 'equalto', 'Creature') | selectattr('items') | list %}
+{% if others %}
+<h2>Nodes, chests and other loot</h2>
+<div class="panel scroll" style="padding:0"><table>
+  <thead><tr><th>Source</th><th class="num">Loots</th><th>Looted</th><th class="num">Value</th></tr></thead>
+  {% for s in others %}
+  <tr><td>{{ s.name }}</td><td class="num">{{ s.loots or "" }}</td>
+    <td class="small">{% for i, n in (s.items.items() | sort(attribute=1, reverse=True))[:5] %}{{ n }}× {{ book.get(i).name if book and book.get(i).name else "item %d" % i }}{{ ", " if not loop.last }}{% endfor %}</td>
+    <td class="num">{{ s.value | gold if s.value else "" }}</td></tr>
+  {% endfor %}
+</table></div>
+{% endif %}
+
+<form method="post" action="/sessions/{{ r.id }}/hide" style="margin-top:16px">
+  <input type="hidden" name="hidden" value="{{ '0' if r.hidden else '1' }}">
+  <button type="submit">{{ "Use for calibration again" if r.hidden else "Don't use for calibration" }}</button>
+  <span class="small muted">{{ "Hidden: not used for kill speed or respawn times." if r.hidden else "e.g. a session spent questing, in a group, or AFK at the auction house." }}</span>
+</form>
+<p class="small muted">{{ r.events | length }} events recorded · id <code>{{ r.id }}</code></p>
+{% endblock %}

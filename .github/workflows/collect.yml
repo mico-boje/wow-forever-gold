@@ -1,0 +1,50 @@
+# Snapshot every Forever auction house once an hour and keep the raw data as an artifact, so
+# hours when your own computer is off aren't lost. Your machine's collector downloads these
+# (`wowgold remote sync`, or `collect` with WOWGOLD_REMOTE_REPO set) and ingests them locally.
+#
+# Needs repository secrets BLIZZARD_CLIENT_ID and BLIZZARD_CLIENT_SECRET. Scheduled runs only
+# happen on the default branch; GitHub may start them a few minutes late.
+name: Collect auction snapshots
+
+on:
+  schedule:
+    - cron: "40 * * * *" # done before the local collector's :05 run
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --frozen --no-dev
+
+      - name: Snapshot all houses
+        env:
+          BLIZZARD_CLIENT_ID: ${{ secrets.BLIZZARD_CLIENT_ID }}
+          BLIZZARD_CLIENT_SECRET: ${{ secrets.BLIZZARD_CLIENT_SECRET }}
+          WOWGOLD_REGION: eu
+        run: |
+          uv run --frozen --no-dev wowgold remote export out
+          echo "STAMP=$(date -u +%Y%m%dT%H%M%SZ)" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ah-snapshots-${{ env.STAMP }}
+          path: out/
+          retention-days: 30
+          compression-level: 0 # the snapshots are gzipped already
+          if-no-files-found: error

@@ -1,0 +1,268 @@
+"""Turn captured Wowhead item pages into item sources (who drops it, what it's mined from...).
+
+Wowhead renders those tabs with `Listview` tables. The userscript sends the page's live
+`g_listviews` objects; if that global ever disappears, the raw `new Listview({...})` script
+blocks are parsed instead. Drop chance is `count / outof` (Wowhead's own loot statistics).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+from .capture import capture_dir
+from .jsdata import array_vars, balanced, parse_js
+
+
+@dataclass(frozen=True)
+class ItemSource:
+    item_id: int
+    kind: str  # drop | skinning | pickpocket | mining | herbalism | object | fishing
+    source_type: str  # npc | object | zone
+    source_id: int
+    source_name: str
+    chance: float | None  # per kill / skin / node, 0-1
+    samples: int | None  # Wowhead's "outof": how many kills/loots the chance is based on
+    zones: tuple[int, ...]
+    level: tuple[int, int] | None = None
+    # Wowhead "react" per faction (alliance, horde): -1 hostile, 0 neutral, 1 friendly
+    react: tuple[int | None, int | None] | None = None
+    elite: bool = False
+    boss: bool = False
+    skill: int | None = None  # gathering skill needed (gathered/mined-from objects)
+    item_name: str = ""  # from the captured page's title
+    from_page: bool = False  # from the source's own NPC/object page (its full loot table)
+
+    def friendly_to(self, faction: str) -> bool:
+        if not self.react:
+            return False
+        return self.react[0 if faction == "alliance" else 1] == 1
+
+
+def classify(tab_id: str, template: str | None) -> tuple[str, str] | None:
+    """(kind, source_type) for a Listview tab that lists where an item comes from."""
+    t = tab_id.lower()
+    if "skinn" in t:
+        return "skinning", "npc"
+    if "pickpocket" in t:
+        return "pickpocket", "npc"
+    if t.startswith("dropped-by") or t == "drop":
+        return "drop", "npc"
+    if "mined" in t:
+        return "mining", "object"
+    if "herb" in t or "gathered" in t:
+        return "herbalism", "object"
+    if "fished" in t:
+        return "fishing", "zone" if template == "zone" else "object"
+    if "contained-in-object" in t:
+        return "object", "object"
+    return None
+
+
+def _num(v) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _rows_to_sources(
+    item_id: int, tab_id: str, template: str | None, rows, item_name: str = ""
+) -> list[ItemSource]:
+    kind = classify(tab_id, template)
+    if kind is None or not isinstance(rows, list):
+        return []
+    out = []
+    for row in rows:
+        if not isinstance(row, dict) or _num(row.get("id")) is None:
+            continue
+        count, outof = _num(row.get("count")), _num(row.get("outof"))
+        chance = None
+        if count is not None and outof:
+            chance = max(0.0, count) / outof
+        elif (pct := _num(row.get("percent"))) is not None:
+            chance = pct / 100
+        loc = row.get("location") or []
+        zones = tuple(
+            int(z) for z in (loc if isinstance(loc, list) else [loc]) if (_num(z) or 0) > 0
+        )
+        lo, hi = _num(row.get("minlevel")), _num(row.get("maxlevel"))
+        react = row.get("react")
+        react_t = None
+        if isinstance(react, list) and len(react) == 2:
+            react_t = tuple(int(x) if _num(x) is not None else None for x in react)
+        out.append(
+            ItemSource(
+                item_id=item_id,
+                kind=kind[0],
+                source_type=kind[1],
+                source_id=int(row["id"]),
+                source_name=str(row.get("name") or row.get("name_enus") or "").lstrip("0123456789"),
+                chance=chance,
+                samples=int(outof) if outof else None,
+                zones=zones,
+                level=(int(lo), int(hi or lo)) if lo else None,
+                react=react_t,
+                elite=(_num(row.get("classification")) or 0) >= 1,
+                boss=bool(row.get("boss")),
+                skill=int(sk) if (sk := _num(row.get("skill"))) else None,
+                item_name=item_name,
+            )
+        )
+    return out
+
+
+def parse_raw_listviews(script: str) -> list[tuple[str, str | None, list]]:
+    """(id, template, data) for each `new Listview({...})` in a page script. Data can be
+    inline or a variable assigned earlier (`var listviewspells = [...]`), and may be
+    JavaScript rather than strict JSON."""
+    out = []
+    variables: dict[str, list] | None = None
+    for m in re.finditer(r"new Listview\(\s*\{", script):
+        body = balanced(script, m.end() - 1)
+        if not body:
+            continue
+        tab = re.search(r"""\bid\s*:\s*['"]([\w-]+)['"]""", body)
+        tmpl = re.search(r"""\btemplate\s*:\s*['"]([\w-]+)['"]""", body)
+        data = re.search(r"\bdata\s*:\s*(\[|[A-Za-z_$][\w$]*)", body)
+        if not (tab and data):
+            continue
+        if data[1] == "[":
+            arr = balanced(body, data.start(1))
+            rows = parse_js(arr) if arr else None
+        else:
+            if variables is None:
+                variables = array_vars(script)
+            rows = variables.get(data[1])
+        if isinstance(rows, list):
+            out.append((tab[1], tmpl[1] if tmpl else None, rows))
+    return out
+
+
+def item_name_from_title(title: str) -> str:
+    """'Fel Crystal - Item - World of Warcraft' -> 'Fel Crystal'."""
+    return title.split(" - ")[0].strip() if " - " in title else ""
+
+
+def sources_from_capture(record: dict, item_id: int) -> list[ItemSource]:
+    name = item_name_from_title(str(record.get("title") or ""))
+    found: list[ItemSource] = []
+    seen_tabs = set()
+    for tab_id, lv in (record.get("listviews") or {}).items():
+        if isinstance(lv, dict) and "data" in lv:
+            got = _rows_to_sources(item_id, tab_id, lv.get("template"), lv["data"], name)
+            if got:
+                seen_tabs.add(tab_id)
+                found += got
+    for script in record.get("raw") or []:
+        for tab_id, template, rows in parse_raw_listviews(script):
+            if tab_id not in seen_tabs:
+                seen_tabs.add(tab_id)
+                found += _rows_to_sources(item_id, tab_id, template, rows, name)
+    return found
+
+
+# -- NPC and object pages: the source's own loot table ---------------------------------------
+
+
+def _is_item_listview(template) -> bool:
+    """Real pages put a config object in `template` (entityType 3 = item); raw scripts a name."""
+    if isinstance(template, dict):
+        return template.get("entityType") == 3
+    return template == "item"
+
+
+def classify_entity_tab(page_kind: str, tab_id: str) -> str | None:
+    """Kind of loot an item tab on an NPC/object page lists, or None for other tabs
+    (sells, teaches, quest rewards, ...)."""
+    t = tab_id.lower()
+    if page_kind == "npc":
+        if "skinn" in t:
+            return "skinning"
+        if "pickpocket" in t:
+            return "pickpocket"
+        if t.startswith("drop"):
+            return "drop"
+        return None
+    if any(w in t for w in ("contain", "mining", "mined", "herb", "gather", "drop", "loot")):
+        return "object"
+    return None
+
+
+def name_from_title(title: str) -> str:
+    """'Muculent Ooze - NPC - Forever' -> 'Muculent Ooze'."""
+    return item_name_from_title(title)
+
+
+def _stack_mean(row: dict) -> float:
+    stack = row.get("stack")
+    if isinstance(stack, list) and len(stack) == 2:
+        lo, hi = _num(stack[0]), _num(stack[1])
+        if lo and hi:
+            return (lo + hi) / 2
+    return 1.0
+
+
+def sources_from_entity_page(record: dict, page_kind: str, entity_id: int) -> list[ItemSource]:
+    """Every item on a captured NPC/object page, as sources of that NPC/object.
+
+    `chance` is the expected count per kill/loot: Wowhead's count/outof times the mean stack."""
+    name = name_from_title(str(record.get("title") or ""))
+    tabs: list[tuple[str, object, list]] = [
+        (tab_id, lv.get("template"), lv.get("data") or [])
+        for tab_id, lv in (record.get("listviews") or {}).items()
+        if isinstance(lv, dict)
+    ]
+    seen = {t[0] for t in tabs}
+    for script in record.get("raw") or []:
+        for tab_id, template, rows in parse_raw_listviews(script):
+            if tab_id not in seen:
+                seen.add(tab_id)
+                tabs.append((tab_id, template, rows))
+    out = []
+    for tab_id, template, rows in tabs:
+        kind = classify_entity_tab(page_kind, tab_id)
+        if kind is None or not _is_item_listview(template) or not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict) or _num(row.get("id")) is None:
+                continue
+            count, outof = _num(row.get("count")), _num(row.get("outof"))
+            if count is None or not outof:
+                continue
+            out.append(
+                ItemSource(
+                    item_id=int(row["id"]),
+                    kind=kind,
+                    source_type="npc" if page_kind == "npc" else "object",
+                    source_id=entity_id,
+                    source_name=name,
+                    chance=max(0.0, count) / outof * _stack_mean(row),
+                    samples=int(outof),
+                    zones=(),
+                    item_name=str(row.get("name") or "").lstrip("0123456789"),
+                    from_page=True,
+                )
+            )
+    return out
+
+
+def load_sources(data_dir: Path) -> list[ItemSource]:
+    """Sources from every captured page: item pages (who drops this item) and NPC/object
+    pages (what this NPC/object drops)."""
+    out = []
+    for path in sorted(capture_dir(data_dir).glob("*.json")):
+        page_kind, _, raw_id = path.stem.partition("-")
+        if not raw_id.isdigit() or page_kind not in ("item", "npc", "object"):
+            continue
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if page_kind == "item":
+            out += sources_from_capture(record, int(raw_id))
+        else:
+            out += sources_from_entity_page(record, page_kind, int(raw_id))
+    return out

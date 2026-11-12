@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..methods.models import Faction, ItemQty, Kind, Method
-from .pricing import ItemPrice, PriceBook
+from .pricing import ItemPrice, PriceBook, trend_flags
 from .profile import CharacterProfile
 
 Z90 = 1.2816  # z-score for the 10th/90th percentile range
@@ -247,8 +247,12 @@ def evaluate(
             )
         elif method.confidence == "estimate":
             ev.flags.append("yields are estimates (not yet measured in Forever)")
+        elif method.confidence == "hypothesis":
+            ev.flags.append("hypothesis from vanilla data: test it in game before relying on it")
     if any(not book.get(i).absorb_measured for i in method.item_ids if book.get(i).market):
         ev.flags.append("demand estimated from listings (no sales history yet)")
+    sold_on_ah = [ln.item_id for ln in ev.lines if ln.item_id and ln.ah_units]
+    ev.flags.extend(trend_flags(book, sold_on_ah))
     return ev
 
 

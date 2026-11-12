@@ -1,0 +1,298 @@
+{% extends "base.html" %}
+{% block title %}Farms · wowgold{% endblock %}
+{% block head %}
+<style>
+  .layout { display: grid; grid-template-columns: 300px 1fr; gap: 24px; align-items: start; }
+  @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } }
+  form.panel { position: sticky; top: 16px; }
+  @media (max-width: 860px) { form.panel { position: static; } }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .field { margin-bottom: 12px; }
+  .profs { display: grid; grid-template-columns: 1fr 64px; gap: 4px 8px; align-items: center;
+           font-size: 13px; }
+  .profs input { padding: 3px 6px; }
+  fieldset { border: 0; padding: 0; margin: 0 0 12px; }
+  legend { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  details.box > summary { cursor: pointer; font-size: 13px; color: var(--muted);
+                          margin-bottom: 8px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+
+  .farms { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+           overflow: hidden; }
+  .farm-head, .farm > summary { display: grid; gap: 12px; align-items: baseline;
+           grid-template-columns: 28px minmax(0, 2.2fr) minmax(0, 1.2fr) 78px 110px
+           minmax(0, 1.8fr); padding: 10px 14px; }
+  .farm-head { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase;
+               letter-spacing: .04em; border-bottom: 1px solid var(--line); }
+  .farm { border-bottom: 1px solid var(--line); }
+  .farm:last-child { border-bottom: 0; }
+  .farm > summary { cursor: pointer; list-style: none; }
+  .farm > summary::-webkit-details-marker { display: none; }
+  .farm > summary:hover { background: var(--chip); }
+  .farm[open] > summary { background: var(--chip); }
+  .farm .name { font-weight: 600; }
+  .gph { font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
+  .rng { color: var(--muted); font-size: 13px; text-align: right; white-space: nowrap; }
+  .body { padding: 4px 14px 16px 54px; }
+  .body ul { margin: 6px 0; padding-left: 18px; }
+  .body table { max-width: 820px; margin-top: 8px; }
+  .body td, .body th { padding: 4px 8px; font-size: 14px; }
+  .body th { font-size: 11px; }
+  .rate { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .rate.slow { color: var(--warn); font-weight: 600; }
+  .items .it { display: block; }
+  @media (max-width: 700px) {
+    .farm-head { display: none; }
+    .farm > summary { grid-template-columns: 24px 1fr auto; }
+    .farm > summary .needs, .farm > summary .items, .farm > summary .rng { grid-column: 2 / 4; }
+    .body { padding-left: 14px; }
+  }
+
+  .chart { display: flex; align-items: flex-end; gap: 8px; height: 160px; padding: 8px 0;
+           border-bottom: 1px solid var(--line); }
+  .chart .col { flex: 1; display: flex; flex-direction: column; align-items: center;
+                justify-content: flex-end; height: 100%; min-width: 0; }
+  .chart .bar { width: 100%; max-width: 56px; background: var(--bar);
+                border-radius: 4px 4px 0 0; min-height: 2px; }
+  .chart .val { font-size: 12px; font-variant-numeric: tabular-nums; margin-bottom: 4px; }
+  .chart-x { display: flex; gap: 8px; font-size: 12px; color: var(--muted); }
+  .chart-x span { flex: 1; text-align: center; }
+  .level-h { display: flex; align-items: baseline; gap: 10px; }
+</style>
+{% endblock %}
+
+{% macro needs(m) -%}
+  <span class="chip">lvl {{ m.requirements.level }}</span>
+  {%- for p, v in m.requirements.professions.items() %}<span class="chip">{{ p }} {{ v }}</span>{% endfor %}
+  {%- if 'elite_mobs' in m.risk %}<span class="chip">elites</span>{% endif %}
+{%- endmacro %}
+
+{% macro rate_span(item_id, produced) -%}
+  {%- if rate -%}{%- set r = rate(item_id) -%}{%- set days = r.days_to_sell(produced) -%}
+  <span class="rate{{ ' slow' if days and days > form.sell_days }}" title="{% if r.market is none %}No AH listings: valued at vendor price{% else %}{{ 'Sold per day on the AH (measured)' if r.measured else 'Estimated sales per day (from listings; measured once the collector has 12h of history)' }}; {{ '{:,}'.format(r.listed) }} listed{% if days %}; your session's {{ '%.0f' | format(produced) }} = {{ '%.1f' | format(days) }} days of sales{% endif %}{% endif %}">{{ r.label() }}</span>{% if r.trend_label() %} <span class="trend {{ r.trend_class }}" title="{{ r.trend_title() }}">{{ r.trend_label() }}</span>{% endif %}
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro farm_list(farms) %}
+<div class="farms">
+  <div class="farm-head"><span>#</span><span>Farm</span><span>Needs</span>
+    <span class="num">Gold/h</span><span class="num">Range</span><span>Best items</span></div>
+  {% for c in farms %}
+  {% set ev = c.evaluation %}{% set m = c.method %}
+  <details class="farm">
+    <summary>
+      <span class="muted">{{ loop.index }}</span>
+      <span><span class="name">{{ m.name }}</span>
+        {%- if c.pages and c.verified == c.pages | length %} <span class="chip ok" title="Forever loot tables captured for all its mobs/nodes">verified</span>
+        {%- elif c.verified %} <span class="chip" title="Forever loot tables captured for some of its mobs/nodes">{{ c.verified_label }} verified</span>{% endif %}
+        <br><span class="muted small">{{ m.zone }}</span></span>
+      <span class="needs">{{ needs(m) }}</span>
+      <span class="gph">{{ c.total_per_hour | gold }}{% if c.craft_extra > 0 %}<br><span class="small muted" style="font-weight:400">+{{ c.craft_extra | gold }} crafting</span>{% endif %}</span>
+      <span class="rng">{{ ev.low | gold }}–{{ ev.high | gold }}</span>
+      <span class="items small">
+        {%- for ln in (ev.lines | selectattr('item_id') | sort(attribute='value', reverse=True))[:3] -%}
+          <span class="it">{{ ln.name }} {{ rate_span(ln.item_id, ln.produced) }}</span>
+        {%- endfor -%}
+      </span>
+    </summary>
+    <div class="body">
+      <div>{{ m.description }}</div>
+      {% if c.evidence %}<ul class="small">{% for e in c.evidence[:8] %}<li>{{ e }}</li>{% endfor %}</ul>{% endif %}
+      <div class="scroll"><table>
+        <thead><tr><th>Item</th><th class="num">Per {{ form.hours | round(1) }}h</th><th class="num">Sells</th>
+          <th class="num">Listed</th><th class="num">Market</th><th>Sold via</th><th class="num">Value</th></tr></thead>
+        {% for ln in (ev.lines | sort(attribute='value', reverse=True))[:8] %}
+        <tr>
+          {% if ln.item_id %}{% set r = rate(ln.item_id) if rate else none %}
+          <td>{{ ln.name }}</td>
+          <td class="num">{{ "%.0f" | format(ln.produced) }}</td>
+          <td class="num">{{ rate_span(ln.item_id, ln.produced) }}</td>
+          <td class="num small muted">{{ "{:,}".format(r.listed) if r and r.market is not none else "" }}</td>
+          <td class="num small">{{ r.market | gold if r and r.market is not none else "" }}{% if r and r.market is not none and r.sell_factor < 0.995 %}<br><span class="trend down" title="{{ r.trend_title() }}">→ {{ (r.market * r.sell_factor) | round | int | gold }}</span>{% endif %}</td>
+          <td class="small muted">{% if ln.vendor_units >= 0.5 and ln.ah_units %}{{ "%.0f" | format(ln.ah_units) }} AH, {{ "%.0f" | format(ln.vendor_units) }} vendor{% elif ln.vendor_units >= 0.5 %}vendor{% else %}AH{% endif %}</td>
+          {% else %}
+          <td colspan="6">coins + vendor trash</td>
+          {% endif %}
+          <td class="num">{{ ln.value | gold }}</td>
+        </tr>
+        {% endfor %}
+      </table></div>
+      <p class="small muted">Sells = units sold per day on your auction house ("~" = estimated from listings). Orange: this session alone would take longer than {{ form.sell_days | round(1) }} days to sell; the excess is valued at vendor price. Arrows: price trend per day (hover for details); a falling item is valued at where its trend puts it when you sell (→), a rising one at today's price.</p>
+      {% if c.craft_notes %}<p class="small"><strong>Craft before selling</strong> (+{{ c.craft_extra | gold }}/h):</p>
+      <ul class="small">{% for n in c.craft_notes %}<li>{{ n }}</li>{% endfor %}</ul>{% endif %}
+      {% if ev.flags %}<ul class="small muted">{% for fl in ev.flags %}<li>{{ fl }}</li>{% endfor %}</ul>{% endif %}
+      <div class="small muted">id <code>{{ m.id }}</code></div>
+    </div>
+  </details>
+  {% else %}
+  <div class="body muted">Nothing found for this character.</div>
+  {% endfor %}
+</div>
+{% endmacro %}
+
+{% macro lead_table(leads) %}
+<div class="panel scroll" style="padding:0">
+<table>
+  <thead><tr><th>Source</th><th>Zone</th>
+    <th>Drops (chance, samples)</th><th class="num">If plentiful</th><th>Notes</th></tr></thead>
+  <tbody>
+  {% for lead in leads %}{% set src = lead.source %}
+  <tr>
+    <td>{% if lead.members | length > 1 %}<strong>{{ lead.title }}</strong>
+      <details class="small"><summary class="muted">{{ lead.members | map(attribute='source.source_name') | list | join(", ") | truncate(60) }}</summary>
+        <ul style="margin:4px 0;padding-left:16px">{% for m in lead.members %}<li><a href="https://www.wowhead.com/forever/{{ m.source.source_type }}={{ m.source.source_id }}" target="_blank" rel="noopener">{{ m.source.source_name }}</a>
+          {%- if m.source.level %} · lvl {{ m.source.level[0] }}–{{ m.source.level[1] }}{% endif %}{% if m.source.elite %} · elite{% endif %}{% if m.spawns %} · {{ m.spawns }} on map{% endif %}
+          · <span class="muted">alone {{ m.gold_per_hour | gold }}/h</span></li>{% endfor %}</ul>
+      </details>
+      {%- else %}<strong><a href="https://www.wowhead.com/forever/{{ src.source_type }}={{ src.source_id }}" target="_blank" rel="noopener">{{ src.source_name }}</a></strong><br><span class="small muted">
+      {{ {"drop": "kill", "skinning": "skin"}.get(lead.kind, lead.kind) }} · {{ src.source_type }} {{ src.source_id }}
+      {% if src.level %} · lvl {{ src.level[0] }}–{{ src.level[1] }}{% endif %}</span>{% endif %}</td>
+    <td>{{ lead.zones[:2] | join(", ") or "?" }}</td>
+    <td class="small">{% for i in lead.items[:4] %}{{ i.name }} {{ "%.1f" | format(i.chance * 100) }}%{% if i.samples %} <span class="muted">(n={{ i.samples }})</span>{% endif %}{% if lead.members | length > 1 %} <span class="muted">· {{ i.source_name }}</span>{% endif %} {{ rate_span(i.item_id, i.per_hour * form.hours) }}<br>{% endfor %}</td>
+    <td class="num"><strong>{{ lead.gold_per_hour | gold }}</strong>/h{% if lead.mix_per_hour is not none %}<br><span class="small muted" title="Killing everything in the group as it comes, weighted by spawn points where Wowhead's map was captured">clearing all: {{ lead.mix_per_hour | gold }}/h</span>{% endif %}</td>
+    <td>{% for fl in lead.flags %}<span class="chip">{{ fl }}</span>{% endfor %}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+<p class="small muted">No spawn data for these, so "if plentiful" assumes full kill speed and counts only the captured items. Mobs in the same zone are one lead: "clearing all" kills whatever comes up (weighted by spawn points when their NPC page is captured); the headline is the better of that and farming the best mob alone. Mobs with no known zone group by name: capture their NPC pages to get zones and map positions (which turns them into camps). Check them in game; Wowhead chances with few samples are noisy.</p>
+{% endmacro %}
+
+{% block main %}
+<div class="layout">
+  <form class="panel" method="get" action="/farms">
+    <input type="hidden" name="submitted" value="1">
+    <div class="row2 field">
+      <div><label for="cls">Class</label>
+        <select id="cls" name="cls" required>
+          <option value="" {{ 'selected' if not form.cls }}>—</option>
+          {% for c in classes %}<option value="{{ c }}" {{ 'selected' if form.cls == c }}>{{ c | capitalize }}</option>{% endfor %}
+        </select></div>
+      <div><label for="faction">Faction</label>
+        <select id="faction" name="faction" required>
+          <option value="" {{ 'selected' if not form.faction }}>—</option>
+          {% for f in ["horde", "alliance"] %}<option value="{{ f }}" {{ 'selected' if form.faction == f }}>{{ f | capitalize }}</option>{% endfor %}
+        </select></div>
+    </div>
+    <div class="row2 field">
+      <div><label for="level">Level</label>
+        <input id="level" name="level" type="number" min="1" max="60" value="{{ form.level or '' }}"></div>
+      <div><label for="gear">Gear</label>
+        <select id="gear" name="gear">{% for g in gears %}<option value="{{ g }}" {{ 'selected' if form.gear == g }}>{{ g }}</option>{% endfor %}</select></div>
+    </div>
+    <fieldset>
+      <legend>Professions (skill, blank = none)</legend>
+      <div class="profs">
+        {% for p in professions %}
+        <span>{{ p.replace('_', ' ') | capitalize }}</span>
+        <input name="prof_{{ p }}" type="number" min="0" max="300" value="{{ form.professions.get(p, '') }}" aria-label="{{ p }} skill">
+        {% endfor %}
+      </div>
+    </fieldset>
+    <div class="field">
+      <label class="check"><input type="checkbox" name="epic_mount" {{ 'checked' if form.epic_mount }}>Epic mount</label>
+      <label class="check"><input type="checkbox" name="elites" {{ 'checked' if form.elites }}>Include elites</label>
+      <label class="check" title="Value yields as the best craft your professions can make from them (see the Crafting tab)"><input type="checkbox" name="craft" {{ 'checked' if form.craft }}>Craft before selling</label>
+    </div>
+    <div class="row2 field">
+      <div><label for="kind">Look for</label>
+        <select id="kind" name="kind">
+          {% for k, label in [("all", "Everything"), ("farm", "Mob camps"), ("gather", "Gathering")] %}
+          <option value="{{ k }}" {{ 'selected' if form.kind == k }}>{{ label }}</option>{% endfor %}
+        </select></div>
+      <div><label for="levels">Leveling sweep</label>
+        <input id="levels" name="levels" placeholder="e.g. 20-60" value="{{ form.levels }}"></div>
+    </div>
+    <details class="box">
+      <summary>More options</summary>
+      <div class="row2 field">
+        <div><label for="hours">Session hours</label><input id="hours" name="hours" type="number" step="0.5" min="0.5" value="{{ form.hours }}"></div>
+        <div><label for="sell_days">Sell within days</label><input id="sell_days" name="sell_days" type="number" step="0.5" min="0.5" value="{{ form.sell_days }}"></div>
+      </div>
+      <div class="row2 field">
+        <div><label for="share">Market share</label><input id="share" name="share" type="number" step="0.05" min="0.05" max="1" value="{{ form.share }}"></div>
+        <div><label for="step">Sweep step</label><input id="step" name="step" type="number" min="1" max="20" value="{{ form.step }}"></div>
+      </div>
+      <div class="row2 field">
+        <div><label for="top">Farms</label><input id="top" name="top" type="number" min="1" max="100" value="{{ form.top }}"></div>
+        <div><label for="leads">Leads</label><input id="leads" name="leads" type="number" min="0" max="100" value="{{ form.leads }}"></div>
+      </div>
+      <div class="field"><label for="house">Auction house</label>
+        <select id="house" name="house">
+          <option value="">Default for faction</option>
+          {% for h in houses %}<option value="{{ h.house_id }}" {{ 'selected' if form.house == h.house_id }}>{{ h.house_id }} · {{ h.faction or '?' }} · {{ (h.last_auctions or 0) + (h.last_commodities or 0) }} listings</option>{% endfor %}
+        </select></div>
+    </details>
+    <div class="actions">
+      <button class="primary" type="submit">Find farms</button>
+      <button type="submit" formaction="/profile" formmethod="post" title="Use these settings by default, here and in the CLI">Save as my profile</button>
+    </div>
+  </form>
+
+  <section>
+    {% if saved_msg == "1" %}<div class="note ok">Saved as your profile.</div>
+    {% elif saved_msg == "error" %}<div class="note bad">Couldn't save: class, faction and level are needed.</div>{% endif %}
+    {% for e in form.errors %}<div class="note bad">{{ e }}</div>{% endfor %}
+    {% if error %}<div class="note bad">{{ error }}</div>{% endif %}
+
+    {% if not res and not error and not form.errors %}
+      <h1>Find farms</h1>
+      <p class="muted">Pick a class and faction (and your professions), then <strong>Find farms</strong>. Camps and gathering loops come from vanilla loot and spawn data, priced at your current auction house data. Enter a range like <code>20-60</code> under <em>Leveling sweep</em> to see the best farms at each level.</p>
+    {% endif %}
+
+    {% if res %}
+      {% set p = res.profile %}
+      <h1>{% if res.sweep %}Best farms while leveling{% else %}Farms for a level {{ p.level }} {{ p.cls }}{% endif %}</h1>
+      <p class="muted small">
+        {{ p.faction | capitalize }} {{ p.cls }} ·
+        {% for k, v in p.professions.items() %}{{ k }} {{ v }}{{ ", " if not loop.last }}{% else %}no professions{% endfor %}
+        · house {{ res.house_ids | join(", ") }}{{ " (yours)" if res.house_source == "confirmed" }}, {{ (res.book.cut * 100) | round | int }}% cut
+        {% if res.placed or res.unplaced %} · {{ res.placed | length }} Wowhead source(s) in camps, {{ res.unplaced | length }} as leads{% endif %}
+        · <a href="/farms/hypotheses.yaml?{{ form.query() }}">download as YAML</a>
+      </p>
+      <p><a class="btn" href="/capture?{{ form.query() }}">Verify these farms on Wowhead</a>
+        <span class="small muted">Capture the mobs' and nodes' Forever loot tables; verified farms are re-scored with them.</span></p>
+      {% with r = res %}{% include "_house_note.html" %}{% endwith %}
+      {% set cal = res.calibration %}{% set ks = cal.kill_speed.get(res.profile.cls) if cal else none %}
+      {% if ks or (cal and cal.respawns) %}
+      <div class="note small">Using your <a href="/sessions">recorded sessions</a>:
+        {%- if ks %} kill speed ×{{ "%.2f" | format(ks.factor) }} for {{ res.profile.cls }}s ({{ ks.gaps }} kills){% endif %}
+        {%- if ks and cal.respawns %};{% endif %}
+        {%- if cal.respawns %} {{ cal.respawns | length }} measured respawn time{{ "s" if cal.respawns | length > 1 }}{% endif %}.</div>
+      {% endif %}
+      <div class="note warn small">Hypotheses from vanilla 1.12 data: drop rates, spawns and respawns may differ in Forever, and kill and gather rates are rough guesses. Test them in game, then record sessions.
+        {% if res.sales_coverage_h < 12 %}Demand is estimated from listings until the collector has {{ "%.0f" | format(12 - res.sales_coverage_h) }} more hours of history.{% endif %}</div>
+
+      {% if res.sweep %}
+        {% if chart %}
+        <div class="panel">
+          <div class="small muted">Best gold per hour at each level</div>
+          <div class="chart" role="img" aria-label="Best gold per hour by level">
+            {% for lvl, v, frac in chart %}
+            <div class="col"><div class="val">{{ v | gold }}</div><div class="bar" style="height: {{ (frac * 100) | round(1) }}%"></div></div>
+            {% endfor %}
+          </div>
+          <div class="chart-x">{% for lvl, v, frac in chart %}<span>{{ lvl }}</span>{% endfor %}</div>
+        </div>
+        {% endif %}
+        {% for r in res.results %}
+          <h2 class="level-h">Level {{ r.profile.level }}
+            <span class="small muted">{% for k, v in r.profile.professions.items() %}{{ k }} {{ v }}{{ ", " if not loop.last }}{% endfor %}</span></h2>
+          {{ farm_list(r.farms) }}
+          {% if r.leads %}<p class="small">Lead: <strong>{{ r.leads[0].source.source_name }}</strong> ({{ r.leads[0].zones[:1] | join }}) — {{ r.leads[0].items[0].name }} {{ "%.1f" | format(r.leads[0].items[0].chance * 100) }}%, ~{{ r.leads[0].gold_per_hour | gold }}/h if plentiful</p>{% endif %}
+        {% endfor %}
+      {% else %}
+        {% set r = res.results[0] %}
+        {{ farm_list(r.farms) }}
+        {% if form.leads %}
+          <h2>Leads from your Wowhead captures</h2>
+          {% if r.leads %}{{ lead_table(r.leads) }}
+          {% elif not form.elites and res.hidden_elite_leads %}<p class="muted small">{{ res.hidden_elite_leads }} captured source(s) without open-world spawns are elite (mostly dungeon mobs). Tick <em>Include elites</em> to see them.</p>
+          {% else %}<p class="muted small">None yet. Capture Forever-only items on the <a href="/capture">Capture</a> page.</p>{% endif %}
+        {% endif %}
+      {% endif %}
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

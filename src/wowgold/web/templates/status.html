@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Status · wowgold{% endblock %}
+{% block head %}
+<style>
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px;
+           margin-top: 16px; }
+  .tile .k { font-size: 12px; color: var(--muted); text-transform: uppercase;
+             letter-spacing: .04em; }
+  .tile .v { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .tile .s { font-size: 13px; color: var(--muted); }
+</style>
+{% endblock %}
+{% block main %}
+<h1>Status</h1>
+{% set errors = day.get("error", 0) %}
+{% if not last %}<div class="note bad">No auction data collected yet: run <code>wowgold collect --once</code>.</div>
+{% elif errors %}<div class="note warn">{{ errors }} failed download(s) in the last 24 hours; see the log below.</div>{% endif %}
+<div class="tiles">
+  <div class="panel tile"><div class="k">Last snapshot</div><div class="v">{{ last | ago }}</div>
+    <div class="s">{{ last or "" }}</div></div>
+  <div class="panel tile"><div class="k">Last 24 hours</div>
+    <div class="v">{{ day.get("stored", 0) }}</div>
+    <div class="s">stored · {{ day.get("unchanged", 0) + day.get("not_modified", 0) }} unchanged · {{ errors }} errors</div></div>
+  <div class="panel tile"><div class="k">Collecting since</div><div class="v">{{ first | ago if first else "—" }}</div>
+    <div class="s">first snapshot {{ (first or "")[:10] }}</div></div>
+  <div class="panel tile"><div class="k">Auction houses</div><div class="v">{{ houses }}</div></div>
+  <div class="panel tile"><div class="k">Items</div><div class="v">{{ "{:,}".format(items) }}</div>
+    <div class="s">{{ "{:,}".format(items - named) }} without a name</div></div>
+  <div class="panel tile"><div class="k">Wowhead captures</div><div class="v">{{ captures }}</div>
+    <div class="s"><a href="/capture">capture more</a></div></div>
+  <div class="panel tile"><div class="k">Vanilla database</div>
+    <div class="v small" style="font-size:15px">{{ vanilla or "missing" }}</div>
+    <div class="s">{% if not vanilla %}run <code>wowgold vanilla fetch</code>{% else %}VMaNGOS, GPL-2.0{% endif %}</div></div>
+</div>
+<h2>Collector log</h2>
+{% if tail %}<pre>{{ tail | join("\n") }}</pre>
+{% else %}<p class="muted">No <code>data/collect.log</code> yet. The cron job writes it hourly (<code>scripts/collect-cron.sh</code>).</p>{% endif %}
+{% endblock %}

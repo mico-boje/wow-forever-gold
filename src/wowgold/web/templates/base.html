@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}wowgold{% endblock %}</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --fg: #1d1c1a; --muted: #6b6862; --line: #e4e1db;
+    --accent: #a8741a; --accent-fg: #ffffff; --link: #8a5a0b; --ok: #2e7d32; --warn: #9a6400;
+    --bad: #b3261e; --bar: #d9a441; --chip: #f1ede4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #131211; --panel: #1c1b19; --fg: #ebe8e2; --muted: #a29d94; --line: #2e2c29;
+      --accent: #e0aa4a; --accent-fg: #1a1406; --link: #f0c06a; --ok: #6cc070; --warn: #e3b25a;
+      --bad: #f07b72; --bar: #c99437; --chip: #26241f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  a { color: var(--link); }
+  header { background: var(--panel); border-bottom: 1px solid var(--line); }
+  header .wrap { display: flex; align-items: center; gap: 24px; padding-top: 12px;
+                 padding-bottom: 12px; flex-wrap: wrap; }
+  .brand { font-weight: 700; letter-spacing: .02em; }
+  .brand span { color: var(--accent); }
+  nav { display: flex; gap: 4px; }
+  nav a { text-decoration: none; color: var(--muted); padding: 6px 12px; border-radius: 6px; }
+  nav a.on { color: var(--fg); background: var(--chip); }
+  .wrap { max-width: 1120px; margin: 0 auto; padding-left: 16px; padding-right: 16px; }
+  main.wrap { padding-top: 24px; padding-bottom: 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 32px 0 8px; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+           padding: 16px; }
+  .note { padding: 10px 14px; border-radius: 8px; background: var(--chip); margin: 12px 0; }
+  .note.warn { color: var(--warn); }
+  .trend { font-size: 12px; white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .trend.down { color: var(--bad); font-weight: 600; }
+  .trend.up { color: var(--ok); }
+  .trend.swing { color: var(--warn); }
+  .note.bad { color: var(--bad); }
+  .note.ok { color: var(--ok); }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+  input, select { font: inherit; color: var(--fg); background: var(--bg); width: 100%;
+                  border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  input[type=checkbox] { width: auto; margin-right: 6px; }
+  .check { display: flex; align-items: center; color: var(--fg); font-size: 14px; }
+  button { font: inherit; padding: 8px 16px; border-radius: 6px; border: 1px solid var(--line);
+           background: var(--panel); color: var(--fg); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent);
+                   color: var(--accent-fg); font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  a.btn { display: inline-block; padding: 7px 14px; border-radius: 6px; text-decoration: none;
+          border: 1px solid var(--accent); color: var(--link); font-weight: 600; }
+  a.btn:hover { background: var(--chip); }
+  .chip.ok { color: var(--ok); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line);
+           vertical-align: top; }
+  th { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase;
+       letter-spacing: .04em; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .chip { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 99px;
+          background: var(--chip); color: var(--muted); margin: 1px 2px 1px 0; }
+  .scroll { overflow-x: auto; }
+  code { font-size: 13px; background: var(--chip); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+        padding: 12px; overflow-x: auto; font-size: 12.5px; line-height: 1.45; }
+</style>
+{% block head %}{% endblock %}
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="brand">wow<span>gold</span></div>
+    <nav>
+      <a href="/farms" class="{{ 'on' if page == 'farms' }}">Farms</a>
+      <a href="/crafting" class="{{ 'on' if page == 'crafting' }}">Crafting</a>
+      <a href="/new" class="{{ 'on' if page == 'new' }}">New in Forever</a>
+      <a href="/sessions" class="{{ 'on' if page in ('sessions', 'session') }}">Sessions</a>
+      <a href="/capture" class="{{ 'on' if page == 'capture' }}">Capture</a>
+      <a href="/houses" class="{{ 'on' if page == 'houses' }}">Houses</a>
+      <a href="/status" class="{{ 'on' if page == 'status' }}">Status</a>
+    </nav>
+  </div>
+</header>
+<main class="wrap">
+{% block main %}{% endblock %}
+</main>
+</body>
+</html>

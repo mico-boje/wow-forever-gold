@@ -1,0 +1,234 @@
+{% extends "base.html" %}
+{% block title %}Capture · wowgold{% endblock %}
+{% block head %}
+<style>
+  .bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 16px 0 8px; }
+  ol { padding-left: 20px; color: var(--muted); max-width: 760px; }
+  .st { width: 24px; color: var(--ok); font-weight: 700; }
+  tr.done a { color: var(--muted); }
+  tr.skipped td:not(:last-child) { opacity: .4; text-decoration: line-through; }
+  .skip { padding: 2px 8px; font-size: 12px; color: var(--muted); }
+  #hint:empty { display: none; }
+  #hint { font-size: 15px; font-weight: 600; border-left: 4px solid var(--warn); }
+</style>
+{% endblock %}
+{% block main %}
+{% if verify is defined %}
+<h1>Verify farms on Wowhead</h1>
+<p class="muted">The NPC and node pages behind the {{ verify_farms }} farm(s) on <a href="{{ back }}">your Farms page</a>. Each captured page brings that mob's or node's <strong>Forever</strong> loot table; with 50+ samples it replaces the vanilla guess, and the farm shows as verified. Install the <a href="/wowgold-capture.user.js">userscript</a> first if you haven't.</p>
+{% if error %}<div class="note bad">{{ error }}</div>{% endif %}
+{% else %}
+<h1>Wowhead capture</h1>
+{% if last and last.version < script_version %}
+<div class="note bad"><strong>Your userscript is outdated</strong> (version {{ last.version }}; the app needs {{ script_version }}). Recipe list pages aren't captured until you update it: open <a href="/wowgold-capture.user.js">the userscript</a> and click <em>Reinstall</em> / <em>Update</em> in Tampermonkey or Violentmonkey, then reload the Wowhead tabs.</div>
+{% endif %}
+<p><a href="/farms">Verify specific farms instead</a> <span class="muted small">(Farms page → Verify on Wowhead)</span></p>
+<ol>
+  <li>Install the <a href="/wowgold-capture.user.js">userscript</a> in Tampermonkey or Violentmonkey (once). It only runs on Wowhead Forever item, NPC and object pages, and only sends to this app.</li>
+  <li>Open the items below. A green "wowgold: saved" badge on the Wowhead page means it was captured. Captures feed the <a href="/farms">Farms</a> page right away.</li>
+  <li>Skip anything crafted (bags, blueprints, bars, dyes): only drops and gathered items help.</li>
+</ol>
+{% endif %}
+{% if arrivals %}
+<h2>Just appeared on the auction house</h2>
+<p class="muted small">Forever items first listed in the last week, without a captured page yet. Capture them while they're new: their Wowhead page says where they drop.</p>
+<div class="panel scroll" style="padding:0">
+<table>
+  <thead><tr><th></th><th>Item</th><th class="num">First seen</th><th class="num">Market</th><th class="num">Listed</th><th></th></tr></thead>
+  <tbody>
+  {% for item_id, ts, p, name in arrivals %}
+  <tr data-key="item-{{ item_id }}">
+    <td class="st"></td>
+    <td><a href="https://www.wowhead.com/forever/item={{ item_id }}" target="_blank" rel="noopener">{{ name }}</a> <span class="chip" style="background:var(--accent);color:var(--accent-fg)">NEW</span></td>
+    <td class="num small">{{ ts | ago }}</td>
+    <td class="num">{{ p.market | gold if p.market else "—" }}</td>
+    <td class="num">{{ "{:,}".format(p.listed_qty) }}</td>
+    <td><button class="skip" type="button">skip</button></td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+
+{% if refresh is defined %}
+<h2>Outdated captures</h2>
+<p class="muted small">Wowhead's numbers grow and change after patches. A capture counts as outdated after {{ refresh.stale_days }} days{% if refresh.stale_before %}, or if it was taken before your patch mark ({{ refresh.stale_before[:16].replace("T", " ") }}){% endif %}. Most worth recapturing first: recipe and item lists, then pages whose drops are worth the most (small Wowhead samples count double).</p>
+{% if saved_msg == "mark-patch" %}<div class="note ok small">Patch marked: everything captured before now is outdated.</div>{% endif %}
+<div class="bar">
+  <form method="post" action="/capture/refresh" style="display:flex;gap:8px;align-items:center">
+    <label for="stale_days" style="margin:0">Outdated after</label>
+    <input id="stale_days" name="stale_days" type="number" min="1" max="365" value="{{ refresh.stale_days }}" style="width:70px"> days
+    <button type="submit">Save</button>
+  </form>
+  <form method="post" action="/capture/refresh"><input type="hidden" name="action" value="mark-patch">
+    <button type="submit" title="Use after a Forever patch: every page captured before now becomes outdated">New patch: mark all outdated</button></form>
+  {% if refresh.stale_before %}<form method="post" action="/capture/refresh"><input type="hidden" name="action" value="clear-mark"><button type="submit" class="skip">clear mark</button></form>{% endif %}
+</div>
+{% if queue %}
+<div class="panel scroll" style="padding:0">
+<table>
+  <thead><tr><th></th><th>Page ({{ queue_total }} outdated)</th><th>Why</th><th class="num">Captured</th><th></th></tr></thead>
+  <tbody>
+  {% for r in queue %}
+  <tr data-key="{{ r.key }}" data-at="{{ r.captured_at }}">
+    <td class="st"></td>
+    <td><a href="{{ r.url }}" target="_blank" rel="noopener">{{ r.title.split(" - ")[0] }}</a> <span class="small muted">{{ r.key }}</span></td>
+    <td class="small muted">{{ r.reason }}</td>
+    <td class="num small">{{ r.captured_at | ago }}</td>
+    <td><button class="skip" type="button">skip</button></td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}<p class="small muted">Nothing outdated.</p>{% endif %}
+{% endif %}
+
+{% if changes %}
+<h2>What changed on recapture</h2>
+<div class="panel" style="padding:8px 14px">
+  {% for pc in changes[:15] %}
+  <details><summary><strong>{{ pc.title.split(" - ")[0] }}</strong> <span class="small muted">{{ pc.changes | length }} change(s) · {{ pc.captured_at | ago }}</span></summary>
+    <ul class="small">
+    {% for c in pc.changes[:20] %}
+      <li>{% if c.kind == "new" %}<strong>new:</strong> {{ c.label }} {{ "%.1f" | format(c.new * 100) }}%
+      {% elif c.kind == "gone" %}<strong>gone:</strong> {{ c.label }} (was {{ "%.1f" | format(c.old * 100) }}%)
+      {% elif c.kind == "rate" %}{{ c.label }}: {{ "%.1f" | format(c.old * 100) }}% → <strong>{{ "%.1f" | format(c.new * 100) }}%</strong>
+      {% else %}{{ c.label }}{% endif %}</li>
+    {% endfor %}
+    </ul>
+  </details>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if recipe_pages is defined and recipe_pages %}
+<h2>Recipes</h2>
+<p class="muted small">Each profession's recipe list on Wowhead holds every recipe: reagents, what it makes, skill and trainer fee. Capture these once (and again after patches) and the <a href="/crafting">Crafting</a> tab knows all Forever recipes. These pages need userscript version 2: <a href="/wowgold-capture.user.js">reinstall it</a> if no badge appears on them.</p>
+<div class="panel scroll" style="padding:0">
+<table>
+  <thead><tr><th></th><th>Profession</th><th class="num">Recipes captured</th><th></th></tr></thead>
+  <tbody>
+  {% for key, name, url, count in recipe_pages %}
+  <tr data-key="{{ key }}">
+    <td class="st"></td>
+    <td><a href="{{ url }}" target="_blank" rel="noopener">{{ name }}</a></td>
+    <td class="num">{{ count if count is not none else "" }}</td>
+    <td><button class="skip" type="button">skip</button></td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+<h2>Forever-only items</h2>
+{% endif %}
+{% if not vanilla %}<div class="note warn">No vanilla database (<code>wowgold vanilla fetch</code>), so this lists all items, not just Forever-only ones.</div>{% endif %}
+<div class="bar">
+  <button id="open" class="primary">Open next 10 in new tabs</button>
+  <span id="progress" class="muted"></span>
+</div>
+<p id="hint" class="note warn small"></p>
+<div class="panel scroll" style="padding:0">
+<table>
+{% if verify is defined %}
+  <thead><tr><th></th><th>Page</th><th>Used by</th><th></th></tr></thead>
+  <tbody>
+  {% for p in verify %}
+  <tr data-key="{{ p.key }}">
+    <td class="st"></td>
+    <td><a href="{{ p.url }}" target="_blank" rel="noopener">{{ p.name }}</a>
+      <br><span class="small muted">{{ "NPC" if p.kind == "npc" else "node" }} {{ p.entity_id }}</span></td>
+    <td class="small">{{ p.farms[:3] | join(", ") }}{% if p.farms | length > 3 %} <span class="muted">+{{ p.farms | length - 3 }} more</span>{% endif %}</td>
+    <td><button class="skip" type="button">skip</button></td>
+  </tr>
+  {% else %}
+  <tr><td colspan="4" class="muted">No farms to verify: run a search on the <a href="/farms">Farms</a> page first.</td></tr>
+  {% endfor %}
+  </tbody>
+{% else %}
+  <thead><tr><th></th><th>Item ({{ targets | length }} most valuable {{ "Forever-only" if vanilla }})</th>
+    <th class="num">Market</th><th class="num">Listed</th><th></th></tr></thead>
+  <tbody>
+  {% for t in targets %}
+  <tr data-key="item-{{ t.item_id }}">
+    <td class="st"></td>
+    <td><a href="{{ t.url }}" target="_blank" rel="noopener">{{ t.name }}</a></td>
+    <td class="num">{{ t.market | gold }}</td>
+    <td class="num">{{ "{:,}".format(t.listed) }}</td>
+    <td><button class="skip" type="button">skip</button></td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="muted">No auction data yet: run <code>wowgold collect --once</code>.</td></tr>
+  {% endfor %}
+  </tbody>
+{% endif %}
+</table>
+</div>
+<script>
+const BATCH = 10, GAP_MS = 800;  // tabs per click, and a pause between them
+let done = {{ done | tojson }}, opened = new Set(), skipped = new Set();
+try { skipped = new Set(JSON.parse(localStorage.getItem("wowgold-skip") || "[]")); } catch (e) {}
+
+function saveSkips() {
+  try { localStorage.setItem("wowgold-skip", JSON.stringify([...skipped])); } catch (e) {}
+}
+function rows() { return [...document.querySelectorAll("tr[data-key]")]; }
+// a row is done when its page is captured (for outdated pages: captured again since)
+function isDone(tr) {
+  const at = done[tr.dataset.key];
+  return at !== undefined && (!tr.dataset.at || at > tr.dataset.at);
+}
+function pending() {
+  return rows().filter((tr) => !isDone(tr) && !skipped.has(tr.dataset.key)
+                               && !opened.has(tr.dataset.key));
+}
+function render() {
+  let n = 0;
+  for (const tr of rows()) {
+    const ok = isDone(tr);
+    tr.classList.toggle("done", ok);
+    tr.classList.toggle("skipped", skipped.has(tr.dataset.key));
+    tr.querySelector(".st").textContent = ok ? "✓" : "";
+    tr.querySelector(".skip").textContent = skipped.has(tr.dataset.key) ? "unskip" : "skip";
+    n += ok;
+  }
+  document.getElementById("progress").textContent = n + " of " + rows().length + " captured";
+  const left = pending().length, btn = document.getElementById("open");
+  btn.disabled = left === 0;
+  btn.textContent = left === 0 ? "Nothing left to open"
+    : "Open next " + Math.min(BATCH, left) + " in new tabs";
+}
+document.getElementById("open").addEventListener("click", () => {
+  const hint = document.getElementById("hint");
+  hint.textContent = "";
+  pending().slice(0, BATCH).forEach((tr, i) => {
+    setTimeout(() => {
+      const win = window.open(tr.querySelector("a").href, "_blank");
+      if (!win) {  // blocked: browsers allow one pop-up per click unless the site is allowed
+        hint.textContent = "Only the first tab opened: your browser blocks a page from opening " +
+          "several tabs at once. Allow pop-ups for 127.0.0.1 (the blocked pop-up icon at the " +
+          "right of the address bar → Always allow), then click again.";
+        hint.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        return;
+      }
+      win.opener = null;
+      opened.add(tr.dataset.key);
+      render();
+    }, i * GAP_MS);
+  });
+});
+document.addEventListener("click", (e) => {
+  if (!e.target.classList.contains("skip")) return;
+  const key = e.target.closest("tr").dataset.key;
+  skipped.has(key) ? skipped.delete(key) : skipped.add(key);
+  saveSkips();
+  render();
+});
+async function refresh() {
+  try { done = await (await fetch("/capture/status")).json(); } catch (e) {}
+  render();
+}
+render(); setInterval(refresh, 2000);
+</script>
+{% endblock %}

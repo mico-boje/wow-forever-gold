@@ -4,10 +4,21 @@ auction houses a plan is made for."""
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 
-AH_CUT = 0.05  # auction house fee on successful sales
+from ..market.trends import Maturity, Trend, load_maturity, load_trends
+
+AH_CUT = 0.05  # auction house fee on successful sales at a faction house
+# Neutral (Blackwater) houses: Classic took 15%. Blizzard hasn't published Forever's rates, so
+# both are the Classic rules.
+NEUTRAL_AH_CUT = 0.15
+NEUTRAL_FACTIONS = ("blackwater", "neutral")
+
+
+def ah_cut(faction: str | None) -> float:
+    return NEUTRAL_AH_CUT if (faction or "").lower() in NEUTRAL_FACTIONS else AH_CUT
+
 
 # Without measured sales we guess daily demand as a fraction of what's listed. Crude, but
 # it scales with how big the market for an item is; replaced by real sales once the
@@ -28,10 +39,19 @@ class ItemPrice:
     sold_per_day: float | None  # measured; None = no sales data
     absorb_per_day: float  # measured or estimated units/day the market takes
     absorb_measured: bool
+    cut: float = AH_CUT  # the house's cut on sales
+    trend: Trend | None = None
+    # What a unit you farm or craft now will fetch when it sells: today's price, lowered for a
+    # falling trend (see market.trends). Buying uses today's price.
+    sell_factor: float = 1.0
+
+    @property
+    def sell_market(self) -> int | None:
+        return round(self.market * self.sell_factor) if self.market else None
 
     @property
     def ah_net(self) -> int | None:
-        return round(self.market * (1 - AH_CUT)) if self.market else None
+        return round(self.market * self.sell_factor * (1 - self.cut)) if self.market else None
 
     @property
     def sell_value(self) -> int:
@@ -44,10 +64,12 @@ class PriceBook:
     house_ids: list[int]
     prices: dict[int, ItemPrice] = field(default_factory=dict)
     sales_coverage_h: float = 0.0
+    cut: float = AH_CUT  # cut on sales at these houses (the highest, if they differ)
+    maturity: Maturity | None = None  # how much price history the numbers rest on
 
     def get(self, item_id: int) -> ItemPrice:
         return self.prices.get(item_id) or ItemPrice(
-            item_id, None, None, 0, 0, None, None, 0.0, False
+            item_id, None, None, 0, 0, None, None, 0.0, False, self.cut
         )
 
 
@@ -72,11 +94,23 @@ def build_price_book(
     item_ids: set[int],
     *,
     now: datetime | None = None,
+    trends: bool = True,
 ) -> PriceBook:
     """Combine the latest snapshot of each house. With several houses, quantities add up
-    and the market price is the quantity-weighted average."""
+    and the market price is the quantity-weighted average. With `trends`, each price carries
+    its trend and sells at the trend-adjusted price."""
     now = now or datetime.now(UTC)
     book = PriceBook(house_ids=list(house_ids))
+    if house_ids:
+        marks = ",".join("?" * len(house_ids))
+        factions = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT faction FROM houses WHERE region = ? AND house_id IN ({marks})",
+                (region, *house_ids),
+            )
+        ]
+        book.cut = max((ah_cut(f) for f in factions), default=AH_CUT)
     if not house_ids or not item_ids:
         return book
     snap_ids = _latest_snapshot_ids(conn, region, house_ids)
@@ -99,17 +133,18 @@ def build_price_book(
     # Sales over the last 24h; coverage = span of snapshots that carried a sales diff.
     since = (now - timedelta(hours=24)).isoformat(timespec="seconds")
     house_marks = ",".join("?" * len(house_ids))
-    cov = conn.execute(
+    cov, kinds = conn.execute(
         f"""
-        SELECT COALESCE(SUM(interval_s), 0) FROM (
-            SELECT DISTINCT snapshot_id, house_id, interval_s FROM price_stats
+        SELECT COALESCE(SUM(interval_s), 0), COUNT(DISTINCT kind) FROM (
+            SELECT DISTINCT snapshot_id, house_id, kind, interval_s FROM price_stats
             WHERE region = ? AND house_id IN ({house_marks}) AND ts >= ? AND interval_s IS NOT NULL
         )
         """,
         (region, *house_ids, since),
-    ).fetchone()[0]
-    # Coverage per house (averaged), in hours.
-    book.sales_coverage_h = cov / 3600 / max(len(house_ids), 1)
+    ).fetchone()
+    # Coverage per feed, averaged over houses, in hours: each house has an auctions and a
+    # commodities feed, and an item is in one of them, so don't count both.
+    book.sales_coverage_h = cov / 3600 / max(len(house_ids) * kinds, 1)
     sold: dict[int, int] = {}
     if book.sales_coverage_h > 0:
         for item_id, qty in conn.execute(
@@ -132,6 +167,8 @@ def build_price_book(
         )
     }
     measured = book.sales_coverage_h >= MIN_SALES_COVERAGE_H
+    book.maturity = load_maturity(conn, region, house_ids, book.sales_coverage_h, now=now)
+    trend_of = load_trends(conn, region, house_ids, item_ids, now=now) if trends else {}
     for item_id in ids:
         weighted, qty = current.get(item_id, (0, 0))
         name, sell, buy = meta.get(item_id, (None, None, None))
@@ -153,5 +190,78 @@ def build_price_book(
             sold_per_day=sold_per_day,
             absorb_per_day=absorb,
             absorb_measured=measured and sold_per_day is not None,
+            cut=book.cut,
+            trend=(t := trend_of.get(item_id)),
+            sell_factor=t.sell_factor if t else 1.0,
         )
     return book
+
+
+def pick_houses(
+    conn: sqlite3.Connection,
+    region: str,
+    faction: str,
+    explicit: list[int] | None = None,
+    configured: list[int] | None = None,
+    mine: dict[str, int] | None = None,
+) -> list[int]:
+    """Houses to price with: explicit choice, else WOWGOLD_HOUSES, else the house you
+    confirmed for this faction, else the busiest house of the faction (a guess: each ruleset
+    has its own)."""
+    if explicit:
+        return list(explicit)
+    if configured:
+        return list(configured)
+    if mine and mine.get(faction):
+        return [mine[faction]]
+    from .. import db
+
+    candidates = [
+        r
+        for r in db.list_houses(conn, region)
+        if r["faction"] == faction and (r["last_auctions"] or r["last_commodities"])
+    ]
+    if not candidates:
+        return []
+    best = max(candidates, key=lambda r: (r["last_auctions"] or 0) + (r["last_commodities"] or 0))
+    return [best["house_id"]]
+
+
+def cap_prices(book: PriceBook, caps: dict[int, float]) -> list[int]:
+    """Cap AH prices at what a vendor sells the item for with unlimited stock: nobody pays
+    more on the AH. Returns the items that were capped."""
+    capped = []
+    for item_id, cap in caps.items():
+        price = book.prices.get(item_id)
+        if price is not None and price.market is not None and price.market > cap:
+            book.prices[item_id] = replace(price, market=round(cap))
+            capped.append(item_id)
+    return capped
+
+
+def trend_flags(book: PriceBook, item_ids, *, max_items: int = 3) -> list[str]:
+    """Risk notes for the items a plan sells: prices falling (and what we valued them at), or
+    swinging a lot around their trend."""
+    falling, swinging = [], []
+    for item_id in dict.fromkeys(item_ids):
+        p = book.get(item_id)
+        t = p.trend
+        if t is None or p.market is None:
+            continue
+        name = p.name or f"item {item_id}"
+        if t.falling:
+            falling.append((t.drift, f"{name} {t.drift * 100:+.0f}%/day"))
+        if t.swings:
+            swinging.append((-t.swing, f"{name} ±{t.swing * 100:.0f}%"))
+    out = []
+    if falling:
+        falling.sort()
+        names = ", ".join(txt for _, txt in falling[:max_items])
+        more = f" +{len(falling) - max_items}" if len(falling) > max_items else ""
+        out.append(f"prices falling: {names}{more} (valued at the projected price on selling)")
+    if swinging:
+        swinging.sort()
+        names = ", ".join(txt for _, txt in swinging[:max_items])
+        more = f" +{len(swinging) - max_items}" if len(swinging) > max_items else ""
+        out.append(f"prices swing a lot: {names}{more}; time your sales")
+    return out

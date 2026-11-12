@@ -18,7 +18,7 @@ from .methods.calibration import apply_calibration, calibrate, load_session_tota
 from .methods.check import check_items, missing_item_ids
 from .methods.models import GearTier, load_methods
 from .planner.engine import PlanOptions, make_plan, upgrade_targets
-from .planner.pricing import build_price_book
+from .planner.pricing import build_price_book, pick_houses
 from .planner.profile import CharacterProfile, parse_professions
 from .probe import Prober, save_report
 from .segments import (
@@ -61,10 +61,23 @@ segments_app = typer.Typer(
     help="Review activity the addon recorded and match it to methods.", no_args_is_help=True
 )
 app.add_typer(segments_app, name="segments")
+vanilla_app = typer.Typer(
+    help="Vanilla world database (VMaNGOS) used by `discover`.", no_args_is_help=True
+)
+app.add_typer(vanilla_app, name="vanilla")
+capture_app = typer.Typer(
+    help="Save Wowhead pages you open in your browser (personal use).", no_args_is_help=True
+)
+app.add_typer(capture_app, name="capture")
 session_app = typer.Typer(
     help="Log play sessions to measure real yields per method.", no_args_is_help=True
 )
 app.add_typer(session_app, name="session")
+remote_app = typer.Typer(
+    help="Hourly snapshots collected on GitHub Actions while your computer is off.",
+    no_args_is_help=True,
+)
+app.add_typer(remote_app, name="remote")
 console = Console()
 
 RegionOpt = Annotated[str | None, typer.Option("--region", "-r", help="us | eu | kr | tw")]
@@ -261,7 +274,118 @@ def houses_set_faction(
     console.print(f"House {house_id} → {faction}")
 
 
+@houses_app.command("find")
+def houses_find(
+    item: Annotated[str, typer.Argument(help="Item name or ID you listed.")],
+    price: Annotated[str, typer.Argument(help="Exact price you listed it at, e.g. 12g34s56c.")],
+    region: RegionOpt = None,
+) -> None:
+    """Find which house is yours: list an item in game at an unusual price, wait for the next
+    snapshot (or run `wowgold collect --once`), then search for that exact listing."""
+    from .market.myhouse import find_listing
+
+    s = get_settings()
+    region = region or s.wowgold_region
+    try:
+        copper = parse_coins(price)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    conn = db.connect(s.db_path)
+    try:
+        matches = find_items(conn, item, limit=1)
+        if not matches:
+            raise typer.BadParameter(f"no item called {item!r}")
+        found = find_listing(conn, region, matches[0].item_id, copper)
+    finally:
+        conn.close()
+    name = matches[0].name or item
+    if not found:
+        console.print(
+            f"No house has {name} listed at {format_money(copper)} in its latest snapshot. "
+            "Snapshots are hourly: wait for the next one or run `wowgold collect --once`."
+        )
+        raise typer.Exit(1)
+    for m in found:
+        console.print(
+            f"House [bold]{m.house_id}[/] ({m.faction or '?'}, {m.kind}): {m.quantity} × {name} "
+            f"at {format_money(copper)} · snapshot {m.fetched_at}"
+        )
+    if len(found) == 1:
+        console.print(
+            f"Save it with `wowgold houses mine {found[0].house_id}` (or on the Status page)."
+        )
+
+
+@houses_app.command("mine")
+def houses_mine(
+    house_id: Annotated[int | None, typer.Argument(help="House ID; omit to show yours.")] = None,
+    clear: Annotated[str | None, typer.Option(help="Forget the house for this faction.")] = None,
+    region: RegionOpt = None,
+) -> None:
+    """Show or set the house you trade on (one per faction)."""
+    from .market.myhouse import load_my_houses, set_my_house
+
+    s = get_settings()
+    region = region or s.wowgold_region
+    if clear:
+        set_my_house(s.wowgold_data_dir, region, clear.lower(), None)
+    elif house_id is not None:
+        conn = db.connect(s.db_path)
+        row = conn.execute(
+            "SELECT faction FROM houses WHERE region = ? AND house_id = ?", (region, house_id)
+        ).fetchone()
+        conn.close()
+        if row is None or not row[0]:
+            raise typer.BadParameter(f"house {house_id} unknown or without a faction")
+        set_my_house(s.wowgold_data_dir, region, row[0], house_id)
+    mine = load_my_houses(s.wowgold_data_dir, region)
+    if not mine:
+        console.print("No house confirmed yet. Find yours with `wowgold houses find`.")
+    for faction, hid in sorted(mine.items()):
+        console.print(f"{faction}: house {hid}")
+
+
 OVERRIDES_FILE = "item_overrides.csv"
+
+
+REMOTE_STALE_H = 2
+
+
+def _remote_sync(conn, s: Settings) -> bool:
+    """Pull snapshots from the GitHub Actions collector. False if that failed (the caller
+    then fetches directly, so the hour isn't lost)."""
+    from .remote import sync
+
+    try:
+        r = sync(conn, s.wowgold_data_dir, s.wowgold_remote_repo)
+    except Exception as exc:  # GitHub unreachable, token missing, ...
+        console.print(f"[yellow]GitHub sync failed ({exc!r}); fetching directly instead[/]")
+        return False
+    console.print(
+        f"GitHub snapshots: {r.artifacts} run(s) downloaded, {r.stored} stored, "
+        f"{r.unchanged} unchanged, {r.skipped} older than what's here"
+        + (f", {r.pending} more next time" if r.pending else "")
+    )
+    for note in r.notes:
+        console.print(f"  [yellow]{note}[/]")
+    # Nothing new from GitHub for a while (workflow paused, failing or not set up yet):
+    # fetch directly rather than leave a hole.
+    from datetime import UTC, datetime, timedelta
+
+    latest = conn.execute("SELECT MAX(fetched_at) FROM snapshots").fetchone()[0]
+    if (
+        not r.stored
+        and not r.unchanged
+        and (
+            latest is None
+            or datetime.fromisoformat(latest) < datetime.now(UTC) - timedelta(hours=REMOTE_STALE_H)
+        )
+    ):
+        console.print(
+            f"[yellow]No GitHub snapshot in the last {REMOTE_STALE_H} hours; fetching directly[/]"
+        )
+        return False
+    return True
 
 
 def _ingest(conn) -> None:
@@ -337,6 +461,40 @@ def prune_cmd(
         conn.close()
 
 
+def _report_new_items(conn, region: str, since: str) -> None:
+    """Log items listed for the first time in this cycle (after the collector's warm-up)."""
+    from datetime import datetime
+
+    from .market.firstseen import WARMUP, collection_start
+
+    start = collection_start(conn, region)
+    if start is None or datetime.fromisoformat(since) < start + WARMUP:
+        return
+    rows = conn.execute(
+        """
+        SELECT ps.item_id, COALESCE(i.name, 'item ' || ps.item_id) FROM price_stats ps
+        LEFT JOIN items i ON i.item_id = ps.item_id
+        WHERE ps.region = ? AND ps.quantity > 0
+        GROUP BY ps.item_id HAVING MIN(ps.ts) >= ?
+        """,
+        (region, since),
+    ).fetchall()
+    rows = [
+        r
+        for r in rows
+        if not conn.execute(
+            "SELECT 1 FROM price_daily WHERE region = ? AND item_id = ? LIMIT 1", (region, r[0])
+        ).fetchone()
+    ]
+    if rows:
+        shown = ", ".join(name for _, name in rows[:8])
+        more = f" and {len(rows) - 8} more" if len(rows) > 8 else ""
+        console.print(
+            f"[yellow]{len(rows)} item(s) on the AH for the first time:[/] {shown}{more} "
+            "(see New in Forever / Capture)"
+        )
+
+
 @app.command()
 def collect(
     region: RegionOpt = None,
@@ -344,10 +502,16 @@ def collect(
     once: Annotated[bool, typer.Option(help="Run a single cycle and exit.")] = False,
     keep_raw: Annotated[int, typer.Option(help="Raw snapshots to keep per house/kind.")] = 2,
     keep_hourly_days: Annotated[int, typer.Option(help="Days of hourly stats to keep.")] = 14,
+    direct: Annotated[
+        bool, typer.Option(help="Fetch from the Blizzard API even if WOWGOLD_REMOTE_REPO is set.")
+    ] = False,
 ) -> None:
-    """Snapshot -> ingest -> item sync -> prune, repeated every N minutes."""
+    """Snapshot -> ingest -> item sync -> prune, repeated every N minutes.
+
+    With WOWGOLD_REMOTE_REPO set, the snapshots come from the GitHub Actions collector
+    (`wowgold remote sync`), including any hours collected while this machine was off."""
     import time
-    from datetime import datetime
+    from datetime import UTC, datetime
 
     s = get_settings()
     while True:
@@ -356,15 +520,19 @@ def collect(
         conn = db.connect(s.db_path)
         try:
             with _client(s, region) as client:
-                summary = run_snapshot(ForeverApi(client), conn, s.wowgold_data_dir)
-                console.print(
-                    f"Snapshot: {summary.stored} stored, {summary.unchanged} unchanged, "
-                    f"{summary.not_modified} not modified, {len(summary.errors)} errors"
-                )
-                for err in summary.errors:
-                    console.print(f"  [red]{err}[/]")
+                if not (s.wowgold_remote_repo and not direct and _remote_sync(conn, s)):
+                    summary = run_snapshot(ForeverApi(client), conn, s.wowgold_data_dir)
+                    console.print(
+                        f"Snapshot: {summary.stored} stored, {summary.unchanged} unchanged, "
+                        f"{summary.not_modified} not modified, {len(summary.errors)} errors"
+                    )
+                    for err in summary.errors:
+                        console.print(f"  [red]{err}[/]")
+                cycle_start = datetime.now(UTC).isoformat(timespec="seconds")
                 _ingest(conn)
                 _sync_items(conn, client, s.wowgold_data_dir)
+                _report_new_items(conn, region or s.wowgold_region, cycle_start)
+                _import_recordings(conn, s)
                 _prune(conn, keep_raw, keep_hourly_days)
         except BlizzardAuthError as exc:
             console.print(f"[red]{exc}[/]")
@@ -471,19 +639,16 @@ def _gold(copper: float | None) -> str:
 
 
 def _pick_houses(conn, region: str, faction: str, explicit: list[int] | None, s: Settings):
-    if explicit:
-        return explicit
-    if s.wowgold_houses:
-        return s.wowgold_houses
-    candidates = [
-        r
-        for r in db.list_houses(conn, region)
-        if r["faction"] == faction and (r["last_auctions"] or r["last_commodities"])
-    ]
-    if not candidates:
-        return []
-    best = max(candidates, key=lambda r: (r["last_auctions"] or 0) + (r["last_commodities"] or 0))
-    return [best["house_id"]]
+    from .market.myhouse import load_my_houses
+
+    return pick_houses(
+        conn,
+        region,
+        faction,
+        explicit,
+        s.wowgold_houses,
+        load_my_houses(s.wowgold_data_dir, region),
+    )
 
 
 @app.command()
@@ -831,6 +996,21 @@ def session_cancel() -> None:
     console.print("Timer discarded.")
 
 
+def _import_recordings(conn, s, *, force: bool = False) -> None:
+    """Pick up sessions the WowGoldLogger addon recorded (files changed since last time)."""
+    from .play.recordings import auto_import
+
+    res = auto_import(conn, s.wowgold_data_dir, s.wowgold_addon_file, force=force)
+    for err in res.errors:
+        console.print(f"  [yellow]addon file: {err}[/]")
+    if res.read:
+        r = res.result
+        console.print(
+            f"Addon sessions: {r.new} new, {r.updated} updated, {r.unchanged} unchanged "
+            f"({len(res.read)} file(s))"
+        )
+
+
 @session_app.command("import")
 def session_import(
     path: Annotated[
@@ -840,15 +1020,33 @@ def session_import(
 ) -> None:
     """Import what the WowGoldLogger addon recorded (safe to re-run).
 
-    Segments that clearly match one method are applied automatically; mixed or unclear
-    ones are listed for review (`wowgold segments`)."""
+    Addon v3 sessions (/wgl start ... stop) are stored for the Sessions page and calibration;
+    the collector also picks them up automatically. Older v0.2 segments that clearly match
+    one method are applied; unclear ones are listed for review (`wowgold segments`)."""
     from pathlib import Path
 
+    from .play import recordings
+
     s = get_settings()
+    file = Path(path).expanduser()
+    try:
+        recs = recordings.read_file(file)
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(f"can't read {path}: {exc}") from exc
+    if recs:
+        conn = db.connect(s.db_path)
+        try:
+            r = recordings.store(conn, recs)
+        finally:
+            conn.close()
+        console.print(
+            f"Recorded sessions (addon v3): {r.new} new, {r.updated} updated, "
+            f"{r.unchanged} unchanged. See them in `wowgold ui` (Sessions)."
+        )
     methods = {m.id: m for m in load_methods(s.wowgold_methods_dir)}
     profile = _resolve_profile(s, None, None, None, None, None, None)
     try:
-        data = read_addon_file(Path(path).expanduser())
+        data = read_addon_file(file)
     except (OSError, ValueError) as exc:
         raise typer.BadParameter(f"can't read {path}: {exc}") from exc
     conn = db.connect(s.db_path)
@@ -875,10 +1073,12 @@ def session_import(
         )
     for msg in summary.skipped:
         console.print(f"  [yellow]skipped {msg}[/]")
-    console.print(
-        f"Segments: {len(summary.segments)} new, {summary.segment_duplicates} already imported"
-        + (" (one still in progress, import it next time)" if data.open_segment else "")
-    )
+    if data.segments or data.open_segment:
+        console.print(
+            f"Segments (addon v0.2): {len(summary.segments)} new, "
+            f"{summary.segment_duplicates} already imported"
+            + (" (one still in progress, import it next time)" if data.open_segment else "")
+        )
     if summary.segments:
         _segment_table([(r.row_id, r.segment, r.proposal, None) for r in summary.segments])
     review = [r for r in summary.segments if r.proposal.status in ("review", "unmatched")]
@@ -1250,3 +1450,667 @@ def segments_draft(
 
 if __name__ == "__main__":
     app()
+
+
+@vanilla_app.command("fetch")
+def vanilla_fetch() -> None:
+    """Download the VMaNGOS world database (SQLite, ~140 MB, GPL-2.0) into data/vanilla/."""
+    from .discovery import vanilla
+
+    s = get_settings()
+    with console.status("Downloading VMaNGOS world database..."):
+        path, name = vanilla.fetch(s.wowgold_data_dir)
+    console.print(f"[green]Installed[/] {name} -> {path}")
+
+
+@app.command()
+def discover(
+    cls: ClassOpt = None,
+    level: LevelOpt = None,
+    faction: FactionOpt = None,
+    prof: ProfOpt = None,
+    gear: GearOpt = None,
+    epic_mount: EpicOpt = None,
+    kind: Annotated[str, typer.Option(help="What to look for: all | farm | gather.")] = "all",
+    elites: Annotated[bool, typer.Option(help="Include elite mobs.")] = False,
+    hours: Annotated[float, typer.Option(help="Length of the play session.")] = 2.0,
+    sell_days: Annotated[float, typer.Option(help="Days you're willing to wait to sell.")] = 3.0,
+    share: Annotated[
+        float, typer.Option(help="Share of daily demand you expect to capture (0-1).")
+    ] = 0.5,
+    house: Annotated[list[int] | None, typer.Option("--house", "-h", help="House ID(s).")] = None,
+    top: Annotated[int, typer.Option(help="How many hypotheses to list.")] = 15,
+    details: Annotated[int, typer.Option(help="Show evidence for the top N.")] = 3,
+    levels: Annotated[
+        str | None,
+        typer.Option(help="Leveling sweep: best farms per level, e.g. 20-60 or 15,30,45."),
+    ] = None,
+    step: Annotated[int, typer.Option(help="Level step for a --levels range.")] = 5,
+    per_level: Annotated[int, typer.Option(help="Farms to show per level in a sweep.")] = 3,
+    leads: Annotated[
+        int, typer.Option(help="Leads to show: captured Forever-only sources without spawn data.")
+    ] = 8,
+    write: Annotated[
+        bool, typer.Option(help="Write the listed hypotheses to data/discovered/hypotheses.yaml.")
+    ] = False,
+    region: RegionOpt = None,
+) -> None:
+    """Find farm hypotheses: vanilla loot and spawn data, priced at current AH prices.
+
+    Ranks for your class (kill speed, mage AoE, rogue pickpocketing), level, faction and
+    professions. With --levels, shows the best farms at each level while leveling, assuming
+    profession skill keeps pace with level (5 per level, capped at what --prof says).
+
+    Mob camps and gathering zones are generated from the VMaNGOS world DB (`wowgold vanilla
+    fetch`), then scored like curated methods. Rates are rough guesses: test the promising
+    ones in game, then record sessions to measure them."""
+
+    from .discovery.discover import parse_levels, to_yaml_entries
+    from .discovery.service import VanillaCache, run_discover
+
+    if kind not in ("all", "farm", "gather"):
+        raise typer.BadParameter("--kind must be all, farm or gather")
+    try:
+        sweep_levels = parse_levels(levels, step) if levels else None
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    s = get_settings()
+    region = region or s.wowgold_region
+    if sweep_levels and level is None and not load_profile(s.profile_path):
+        level = sweep_levels[-1]
+    profile = _resolve_profile(s, cls, level, faction, prof, gear, epic_mount)
+    opts = PlanOptions(hours=hours, sell_days=sell_days, market_share=share)
+    conn = db.connect(s.db_path)
+    try:
+        with console.status("Scoring camps, gathering zones and leads..."):
+            res = run_discover(
+                VanillaCache(s.wowgold_data_dir),
+                conn,
+                profile,
+                opts,
+                region=region,
+                house=house,
+                configured_houses=s.wowgold_houses,
+                kind=kind,
+                elites=elites,
+                levels=sweep_levels,
+                top=per_level if sweep_levels else top,
+                leads=1 if sweep_levels else leads,
+            )
+    except (FileNotFoundError, LookupError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+    finally:
+        conn.close()
+
+    if res.sweep:
+        _print_sweep(
+            profile,
+            res.house_ids,
+            [(r.profile, r.farms) for r in res.results],
+            per_level,
+            res.placed,
+            res.unplaced,
+        )
+        best_leads = [(r.profile.level, r.leads[0]) for r in res.results if r.leads]
+        if leads and best_leads:
+            _print_leads(
+                [lead for _, lead in best_leads],
+                "Best lead per level",
+                levels=[lvl for lvl, _ in best_leads],
+            )
+        if write:
+            chosen, seen = [], set()
+            for r in res.results:
+                for c in r.farms:
+                    if c.method.id not in seen:
+                        seen.add(c.method.id)
+                        chosen.append(c)
+            _write_hypotheses(s, chosen, to_yaml_entries)
+        return
+
+    ranked, found_leads = res.results[0].farms, res.results[0].leads
+    console.print(
+        f"[bold]Hypotheses for {_describe(profile)}[/] · house {', '.join(map(str, res.house_ids))}"
+    )
+    if res.placed or res.unplaced:
+        console.print(
+            f"Wowhead captures: {len(res.placed)} item source(s) added to vanilla mobs/nodes, "
+            f"{len(res.unplaced)} without open-world spawns (shown as leads)."
+        )
+    console.print(
+        "[yellow]From vanilla 1.12 data: drop rates, spawns and respawns may differ in Forever, "
+        "and Forever-only items are missing. Kill and gather rates are rough guesses.[/]"
+    )
+    table = Table(title="Farms worth testing", title_justify="left")
+    for col, just in (
+        ("#", "right"),
+        ("hypothesis", "left"),
+        ("needs", "left"),
+        ("gold/h", "right"),
+        ("range", "right"),
+        ("best items", "left"),
+    ):
+        table.add_column(col, justify=just)
+    for n, c in enumerate(ranked, start=1):
+        ev, m = c.evaluation, c.method
+        best = sorted((ln for ln in ev.lines if ln.item_id), key=lambda ln: -ln.value)[:3]
+        table.add_row(
+            str(n),
+            f"{m.name}\n[dim]{m.zone} · {m.id}[/]",
+            _needs(m),
+            _gold(ev.gold_per_hour),
+            f"{_gold(ev.low)}-{_gold(ev.high)}",
+            ", ".join(ln.name for ln in best),
+        )
+    console.print(table)
+    for c in ranked[:details]:
+        console.print(f"\n[bold]{c.method.name}[/] — {c.method.description}")
+        for line in c.evidence[:6]:
+            console.print(f"  [dim]•[/] {line}")
+        for ln in sorted(c.evaluation.lines, key=lambda ln: -ln.value)[:6]:
+            label = (
+                "coins + vendor trash" if ln.item_id == 0 else f"{ln.produced:>5.0f} × {ln.name}"
+            )
+            console.print(f"    {label:<34} {_gold(ln.value):>8}")
+    if leads and found_leads:
+        _print_leads(found_leads, "Leads: Forever-only sources from your Wowhead captures")
+    elif leads and not elites and res.hidden_elite_leads:
+        console.print(
+            f"\n[dim]{res.hidden_elite_leads} captured source(s) without open-world spawns are "
+            "elite (mostly dungeon mobs): add --elites to list them as leads.[/]"
+        )
+    if write:
+        _write_hypotheses(s, ranked, to_yaml_entries)
+
+
+def _print_leads(found, title: str, levels: list[int] | None = None) -> None:
+    console.print()
+    table = Table(title=title, title_justify="left")
+    cols = [("level", "right")] if levels else []
+    cols += [
+        ("source", "left"),
+        ("zone", "left"),
+        ("drops (chance, samples)", "left"),
+        ("if plentiful", "right"),
+        ("notes", "left"),
+    ]
+    for col, just in cols:
+        table.add_column(col, justify=just)
+    for n, lead in enumerate(found):
+        src = lead.source
+        lvl = f"lvl {src.level[0]}-{src.level[1]}" if src.level else ""
+        what = {"drop": "kill", "skinning": "skin", "pickpocket": "pickpocket"}.get(
+            lead.kind, lead.kind
+        )
+        drops = "\n".join(
+            f"{i.name} {i.chance:.1%}" + (f" (n={i.samples})" if i.samples else "")
+            for i in lead.items[:3]
+        )
+        row = [str(levels[n])] if levels else []
+        if len(lead.members) > 1:
+            mobs = ", ".join(m.source.source_name for m in lead.members[:4])
+            more = f" +{len(lead.members) - 4}" if len(lead.members) > 4 else ""
+            name = f"{lead.title}\n[dim]{mobs}{more}[/]"
+        else:
+            name = f"{src.source_name}\n[dim]{what} · {src.source_type} {src.source_id} {lvl}[/]"
+        row += [
+            name,
+            ", ".join(lead.zones[:2]) or "?",
+            drops,
+            f"{_gold(lead.gold_per_hour)}/h",
+            ", ".join(lead.flags),
+        ]
+        table.add_row(*row)
+    console.print(table)
+    console.print(
+        "[dim]No spawn data for these: 'if plentiful' assumes you can keep killing (or "
+        "gathering) at full speed and counts only the captured items. Check numbers and "
+        "competition in game; Wowhead chances with few samples are noisy.[/]"
+    )
+
+
+def _needs(m) -> str:
+    req = m.requirements
+    return ", ".join(
+        [f"lvl {req.level}"]
+        + [f"{p} {v}" for p, v in req.professions.items()]
+        + (["elites"] if "elite_mobs" in m.risk else [])
+    )
+
+
+def _write_hypotheses(s: Settings, cands, to_yaml_entries) -> None:
+    import yaml
+
+    if not cands:
+        return
+    out = s.wowgold_data_dir / "discovered" / "hypotheses.yaml"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        "# Generated by `wowgold discover`. Copy the ones you want to test into\n"
+        "# data/methods/ (e.g. data/methods/hypotheses.yaml), then record sessions.\n"
+        + yaml.safe_dump(to_yaml_entries(cands), sort_keys=False, allow_unicode=True)
+    )
+    console.print(f"\n[green]Wrote {len(cands)} hypotheses[/] to {out}")
+
+
+def _print_sweep(profile, house_ids, results, per_level, placed, unplaced) -> None:
+    profs = ", ".join(f"{p} {v}" for p, v in profile.professions.items()) or "no professions"
+    console.print(
+        f"[bold]Leveling sweep: {profile.faction} {profile.cls}[/] ({profs} at most; skill "
+        f"assumed to keep pace with level) · house {', '.join(map(str, house_ids))}"
+    )
+    if placed or unplaced:
+        console.print(f"Wowhead captures: {len(placed)} item source(s) used.")
+    console.print(
+        "[yellow]Vanilla data at today's prices: rates are rough guesses, and prices will move "
+        "as the server ages.[/]"
+    )
+    table = Table(title="Best farms by level", title_justify="left")
+    for col, just in (
+        ("level", "right"),
+        ("#", "right"),
+        ("hypothesis", "left"),
+        ("needs", "left"),
+        ("gold/h", "right"),
+        ("best items", "left"),
+    ):
+        table.add_column(col, justify=just)
+    for at, ranked in results:
+        if not ranked:
+            table.add_row(str(at.level), "", "[dim]nothing found[/]", "", "", "", end_section=True)
+            continue
+        shown = ranked[:per_level]
+        for n, c in enumerate(shown, start=1):
+            ev = c.evaluation
+            best = sorted((ln for ln in ev.lines if ln.item_id), key=lambda ln: -ln.value)[:3]
+            table.add_row(
+                str(at.level) if n == 1 else "",
+                str(n),
+                f"{c.method.name}\n[dim]{c.method.zone} · {c.method.id}[/]",
+                _needs(c.method),
+                _gold(ev.gold_per_hour),
+                ", ".join(ln.name for ln in best),
+                end_section=n == len(shown),
+            )
+    console.print(table)
+
+
+def _serve_ui(port: int, path: str = "/") -> None:
+    import uvicorn
+
+    from .web.app import create_app
+
+    url = f"http://127.0.0.1:{port}{path}"
+    console.print(f"wowgold UI on [bold]{url}[/]  (Ctrl+C to stop)")
+    console.print(f"[dim]Wowhead userscript: http://127.0.0.1:{port}/wowgold-capture.user.js[/]")
+    uvicorn.run(create_app(), host="127.0.0.1", port=port, log_level="warning")
+
+
+@app.command()
+def ui(port: Annotated[int, typer.Option(help="Local port.")] = 8765) -> None:
+    """Open the local web UI: farms, leveling sweep, leads, Wowhead capture, collector status.
+
+    Listens on 127.0.0.1 only. On WSL, open the printed address in your Windows browser."""
+    _serve_ui(port)
+
+
+@capture_app.command("serve")
+def capture_serve(port: Annotated[int, typer.Option(help="Local port.")] = 8765) -> None:
+    """Start the web UI on its Capture page (same as `wowgold ui`)."""
+    _serve_ui(port, "/capture")
+
+
+@capture_app.command("sources")
+def capture_sources() -> None:
+    """Show item sources parsed from your Wowhead captures, and whether discover can use them."""
+    from .discovery import vanilla
+    from .discovery.discover import VanillaData
+    from .wowhead.sources import load_sources
+
+    s = get_settings()
+    sources = load_sources(s.wowgold_data_dir)
+    if not sources:
+        console.print("No sources captured yet. Run `wowgold capture serve`.")
+        return
+    placed_ids: set[tuple] = set()
+    try:
+        vconn = vanilla.connect(vanilla.db_path(s.wowgold_data_dir))
+        data = VanillaData.load(vconn)
+        placed, _ = data.add_sources(sources)
+        placed_ids = {(p.item_id, p.kind, p.source_id) for p in placed}
+        vconn.close()
+    except FileNotFoundError:
+        pass
+    conn = db.connect(s.db_path)
+    try:
+        names = {r[0]: r[1] for r in conn.execute("SELECT item_id, name FROM items")}
+    finally:
+        conn.close()
+    table = Table(title="Captured item sources", title_justify="left")
+    for col, just in (
+        ("item", "left"),
+        ("how", "left"),
+        ("source", "left"),
+        ("chance", "right"),
+        ("samples", "right"),
+        ("used by discover", "left"),
+    ):
+        table.add_column(col, justify=just)
+    for src in sorted(sources, key=lambda x: (x.item_id, -(x.chance or 0))):
+        used = (src.item_id, src.kind, src.source_id) in placed_ids
+        table.add_row(
+            names.get(src.item_id) or str(src.item_id),
+            src.kind,
+            f"{src.source_name} [dim]{src.source_type} {src.source_id}[/]",
+            f"{src.chance:.1%}" if src.chance is not None else "-",
+            f"{src.samples:,}" if src.samples else "-",
+            "camp" if used else "[dim]lead (no open-world spawns)[/]",
+        )
+    console.print(table)
+
+
+@app.command()
+def crafts(
+    faction: FactionOpt = None,
+    prof: ProfOpt = None,
+    everything: Annotated[
+        bool, typer.Option("--all", help="Include recipes your skill can't make yet.")
+    ] = False,
+    min_sales: Annotated[
+        float, typer.Option(help="Only outputs selling at least this many per day.")
+    ] = 0.0,
+    cooldowns: Annotated[bool, typer.Option(help="Include cooldown crafts.")] = True,
+    sell_days: Annotated[float, typer.Option(help="Days you're willing to wait to sell.")] = 3.0,
+    share: Annotated[
+        float, typer.Option(help="Share of daily demand you expect to capture (0-1).")
+    ] = 0.5,
+    house: Annotated[list[int] | None, typer.Option("--house", "-h", help="House ID(s).")] = None,
+    top: Annotated[int, typer.Option(help="How many crafts to list.")] = 20,
+    region: RegionOpt = None,
+) -> None:
+    """Crafts that make money buying the materials, and what to craft from your own mats.
+
+    Vanilla recipes plus Forever recipes from your Wowhead captures. Profession skills and
+    faction default to your saved profile."""
+    from .crafting.profit import CraftOptions
+    from .discovery.service import VanillaCache, run_crafting
+
+    s = get_settings()
+    region = region or s.wowgold_region
+    saved = load_profile(s.profile_path)
+    fac = (faction or (saved.faction if saved else "")).lower()
+    try:
+        profs = parse_professions(prof) if prof else dict(saved.professions if saved else {})
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if fac not in ("horde", "alliance"):
+        raise typer.BadParameter("pass --faction or save a profile")
+    conn = db.connect(s.db_path)
+    try:
+        with console.status("Pricing recipes..."):
+            res = run_crafting(
+                VanillaCache(s.wowgold_data_dir),
+                conn,
+                faction=fac,
+                professions=profs,
+                opts=CraftOptions(sell_days=sell_days, market_share=share),
+                region=region,
+                house=house,
+                configured_houses=s.wowgold_houses,
+                only_craftable=not everything,
+                min_sales=min_sales,
+                cooldowns=cooldowns,
+                top=top,
+            )
+    except (FileNotFoundError, LookupError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+    finally:
+        conn.close()
+
+    shown = ", ".join(f"{p} {v}" for p, v in profs.items()) or "no professions"
+    console.print(
+        f"[bold]Crafts for {fac} ({shown})[/] · house {', '.join(map(str, res.house_ids))} · "
+        f"{res.recipes_total} recipes, {res.recipes_forever} from Wowhead captures"
+    )
+    table = Table(title="Crafts that make money (buying the materials)", title_justify="left")
+    for col, just in (
+        ("recipe", "left"),
+        ("mats", "right"),
+        ("sells for", "right"),
+        ("profit", "right"),
+        ("crafts/day", "right"),
+        ("per day", "right"),
+        ("learn", "left"),
+    ):
+        table.add_column(col, justify=just)
+    for e in res.crafts:
+        r = e.recipe
+        tag = " [yellow]Forever[/]" if r.source == "wowhead" else ""
+        table.add_row(
+            f"{r.name}{tag}\n[dim]{r.profession} {r.skill} → {e.output_name}[/]",
+            _gold(e.cost),
+            _gold(e.output_value),
+            _gold(e.profit),
+            f"{e.crafts_per_day:.1f}\n[dim]{e.limited_by}[/]",
+            _gold(e.profit_per_day),
+            e.learn_label + (f" {_gold(e.learn_cost)}" if e.learn_cost else ""),
+        )
+    console.print(table)
+    if res.processing:
+        proc = Table(title="Craft what you farm", title_justify="left")
+        for col, just in (
+            ("material", "left"),
+            ("sell raw", "right"),
+            ("best craft", "left"),
+            ("worth crafted", "right"),
+            ("per day", "right"),
+        ):
+            proc.add_column(col, justify=just)
+        for p in res.processing[:10]:
+            proc.add_row(
+                p.name,
+                _gold(p.raw_value),
+                f"{p.via.output_name}\n[dim]{p.via.recipe.name}[/]",
+                _gold(p.value_per_unit),
+                f"{p.units_per_day:.1f}" if p.units_per_day < 10 else f"{p.units_per_day:.0f}",
+            )
+        console.print(proc)
+
+
+@app.command("new-items")
+def new_items_cmd(
+    faction: FactionOpt = None,
+    status: Annotated[
+        str | None,
+        typer.Option(help="Only this status: camp | lead | crafted | vendor | listed | unknown."),
+    ] = None,
+    top: Annotated[int, typer.Option(help="How many items to list.")] = 30,
+    region: RegionOpt = None,
+) -> None:
+    """Items new in Forever: price, sell rate and where they come from, most valuable first."""
+    from .discovery.newitems import STATUS_LABEL
+    from .discovery.service import VanillaCache, run_new_items
+
+    s = get_settings()
+    region = region or s.wowgold_region
+    saved = load_profile(s.profile_path)
+    fac = (faction or (saved.faction if saved else "")).lower()
+    if fac not in ("horde", "alliance"):
+        raise typer.BadParameter("pass --faction or save a profile")
+    conn = db.connect(s.db_path)
+    try:
+        res = run_new_items(
+            VanillaCache(s.wowgold_data_dir),
+            conn,
+            faction=fac,
+            region=region,
+            configured_houses=s.wowgold_houses,
+        )
+    except (FileNotFoundError, LookupError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+    finally:
+        conn.close()
+    o = res.overview
+    console.print(
+        f"[bold]{len(o.items)} items new in Forever[/] · house "
+        f"{', '.join(map(str, res.house_ids))} · "
+        + ", ".join(f"{STATUS_LABEL[k]} {v}" for k, v in sorted(o.counts.items()))
+    )
+    table = Table(title_justify="left")
+    for col, just in (
+        ("item", "left"),
+        ("price", "right"),
+        ("sells/day", "right"),
+        ("status", "left"),
+        ("where from", "left"),
+    ):
+        table.add_column(col, justify=just)
+    for it in [i for i in o.items if not status or i.status == status][:top]:
+        rate = (
+            "-" if it.sold_per_day is None else f"{'' if it.measured else '~'}{it.sold_per_day:.0f}"
+        )
+        table.add_row(
+            f"{it.name}\n[dim]{it.item_id}[/]",
+            _gold(it.market),
+            rate,
+            STATUS_LABEL[it.status],
+            "\n".join(src.text for src in it.sources[:2]),
+        )
+    console.print(table)
+    if o.unnamed:
+        console.print(f"[dim]{o.unnamed} unnamed: `wowgold items wowhead-names` looks them up.[/]")
+
+
+@items_app.command("wowhead-names")
+def items_wowhead_names(
+    limit: Annotated[int, typer.Option(help="Most names to look up in this run.")] = 1000,
+    faction: FactionOpt = None,
+    region: RegionOpt = None,
+) -> None:
+    """Look up names of new Forever items on Wowhead's tooltip API, one per second.
+
+    Names from your Wowhead captures are used first (free); this fetches the rest and stores
+    them, so each item is only ever looked up once."""
+    from .discovery.service import VanillaCache, run_new_items
+    from .wowhead.names import fetch_tooltip_names, unnamed_item_ids
+
+    s = get_settings()
+    region = region or s.wowgold_region
+    saved = load_profile(s.profile_path)
+    fac = (faction or (saved.faction if saved else "horde")).lower()
+    conn = db.connect(s.db_path)
+    try:
+        res = run_new_items(
+            VanillaCache(s.wowgold_data_dir),
+            conn,
+            faction=fac,
+            region=region,
+            configured_houses=s.wowgold_houses,
+        )
+        if res.names_added:
+            console.print(f"{res.names_added} names taken from your Wowhead captures.")
+        ids = unnamed_item_ids(
+            conn, {it.item_id for it in res.overview.items if it.name.startswith("item ")}
+        )[:limit]
+        if not ids:
+            console.print("Every new item has a name.")
+            return
+        console.print(f"Looking up {len(ids)} names (about {len(ids) // 60 + 1} min)...")
+
+        def progress(n: int, total: int, name: str | None) -> None:
+            if n % 25 == 0 or n == total:
+                console.print(f"  {n}/{total}" + (f" · {name}" if name else ""))
+
+        found, missing = fetch_tooltip_names(conn, ids, on_progress=progress)
+    except (FileNotFoundError, LookupError) as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+    finally:
+        conn.close()
+    console.print(f"[green]{found} found[/], {missing} unknown to Wowhead.")
+
+
+@capture_app.command("outdated")
+def capture_outdated(
+    top: Annotated[int, typer.Option(help="How many pages to list.")] = 30,
+) -> None:
+    """Outdated Wowhead captures, most worth recapturing first."""
+    from .wowhead.refresh import load_settings, recapture_queue
+
+    s = get_settings()
+    settings = load_settings(s.wowgold_data_dir)
+    queue = recapture_queue(s.wowgold_data_dir, lambda _i: 1.0)
+    console.print(
+        f"{len(queue)} outdated (older than {settings['stale_days']} days"
+        + (f" or before {settings['stale_before']}" if settings["stale_before"] else "")
+        + "). The Capture page in `wowgold ui` ranks them by value and opens them in tabs."
+    )
+    for r in queue[:top]:
+        console.print(f"  {r.key:<36} {r.reason:<36} {r.url}")
+
+
+@capture_app.command("mark-patch")
+def capture_mark_patch() -> None:
+    """After a Forever patch: mark every capture taken before now as outdated."""
+    from .wowhead.refresh import mark_patch
+
+    s = get_settings()
+    settings = mark_patch(s.wowgold_data_dir)
+    console.print(f"Captures before {settings['stale_before']} are now outdated.")
+
+
+@remote_app.command("export")
+def remote_export(
+    out: Annotated[str, typer.Argument(help="Folder to write raw snapshots + manifest.json to.")],
+    region: RegionOpt = None,
+) -> None:
+    """Fetch every auction house once into a folder (what the GitHub workflow uploads)."""
+    from pathlib import Path
+
+    from .remote import export_snapshot
+
+    s = get_settings()
+    with _client(s, region) as client:
+        summary = export_snapshot(ForeverApi(client), Path(out))
+    console.print(
+        f"Snapshot: {summary.stored} stored, {summary.unchanged} unchanged, "
+        f"{len(summary.errors)} errors"
+    )
+    for err in summary.errors:
+        console.print(f"  [red]{err}[/]")
+    if not summary.stored:
+        raise typer.Exit(1)
+
+
+@remote_app.command("sync")
+def remote_sync(
+    repo: Annotated[
+        str | None, typer.Option(help="owner/name; default WOWGOLD_REMOTE_REPO.")
+    ] = None,
+    ingest: Annotated[bool, typer.Option(help="Ingest what was downloaded.")] = True,
+) -> None:
+    """Download the GitHub collector's snapshots you don't have yet (safe to re-run)."""
+    from .remote import sync
+
+    s = get_settings()
+    repo = repo or s.wowgold_remote_repo
+    if not repo:
+        raise typer.BadParameter("set WOWGOLD_REMOTE_REPO in .env or pass --repo owner/name")
+    conn = db.connect(s.db_path)
+    try:
+        r = sync(conn, s.wowgold_data_dir, repo)
+        console.print(
+            f"{r.artifacts} run(s) downloaded: {r.stored} snapshots stored, {r.unchanged} "
+            f"unchanged, {r.skipped} older than what's here"
+            + (f"; {r.pending} more runs next time" if r.pending else "")
+            + (f". Workflow: {r.workflow}" if r.workflow else "")
+        )
+        for note in r.notes:
+            console.print(f"  [yellow]{note}[/]")
+        if ingest:
+            _ingest(conn)
+    finally:
+        conn.close()

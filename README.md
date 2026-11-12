@@ -12,6 +12,29 @@ cp .env.example .env   # add BLIZZARD_CLIENT_ID / BLIZZARD_CLIENT_SECRET
 Create API credentials at https://develop.battle.net/access/clients. Use a supported locale
 (`en_GB`, `en_US`, `de_DE`, …) — an unsupported one makes Blizzard return empty names.
 
+## Web UI
+
+```bash
+uv run wowgold ui            # http://127.0.0.1:8765/
+```
+
+A local web app (127.0.0.1 only) with three pages:
+
+- **Farms:** enter class, level, faction and professions (or use your saved profile) and get
+  ranked farms with their evidence, leads from your Wowhead captures, a leveling sweep with a
+  chart of the best gold/h per level, and a YAML download for testing. "Save as my profile"
+  saves the character for the CLI too.
+- **Crafting:** crafts that make money buying the materials, and what to craft from your own
+  materials (see [Crafting](#crafting)).
+- **New in Forever:** every item that isn't in vanilla, with price, sell rate and where it
+  comes from (see below).
+- **Capture:** the Wowhead to-do list and the userscript endpoint (see below).
+- **Houses:** find and save the auction house you trade on (see below).
+- **Status:** when the collector last ran, failures in the last 24 hours, and the log tail.
+
+The CLI stays the tool for cron and scripting; both use the same code. On WSL, open the address
+in your Windows browser (WSL forwards localhost).
+
 ## Commands
 
 | Command | What it does |
@@ -27,7 +50,18 @@ Create API credentials at https://develop.battle.net/access/clients. Use a suppo
 | `wowgold session start/stop/log/import` | Record real farming sessions to calibrate yields (see below). |
 | `wowgold methods show herb_felwood` | Estimated vs measured vs calibrated yields for a method. |
 | `wowgold methods list` / `methods check` | Show curated methods; verify their item IDs against Blizzard's item data. |
+| `wowgold houses find "Linen Cloth" 12g34s56c` | Find your house: search every house for an exact listing you posted in game. |
+| `wowgold houses mine 113` | Save (or show) the house you trade on, per faction. |
 | `wowgold houses list` | Houses with faction and listing counts. `houses set-faction` to override. |
+| `wowgold vanilla fetch` | Download the VMaNGOS vanilla world database (loot tables, spawns) used by `discover`. |
+| `wowgold discover` | Generate farm hypotheses (mob camps, gathering loops) from vanilla data at current prices. |
+| `wowgold crafts -f horde -p alchemy:300` | Profitable crafts from bought materials, and what to craft from your own mats. |
+| `wowgold new-items` | Items new in Forever: price, sell rate and known sources, most valuable first. |
+| `wowgold items wowhead-names` | Look up names of new items on Wowhead's tooltip API (1 per second, cached). |
+| `wowgold capture outdated` / `capture mark-patch` | List outdated Wowhead captures; after a patch, mark everything outdated. |
+| `wowgold ui` | Local web UI: farms, leveling sweep, leads, crafting, recorded sessions, Wowhead capture, collector status. |
+| `wowgold capture serve` | Same as `wowgold ui`, opening on the Capture page. |
+| `wowgold capture sources` | Item sources parsed from your captures, and whether `discover` can use them. |
 | `wowgold prune` | Delete old raw files (keeps 2 per house) and roll hourly stats older than 14 days into daily rows. |
 
 Set `WOWGOLD_HOUSES=[113]` in `.env` to limit `prices` to the house(s) you trade on.
@@ -37,12 +71,85 @@ Names for items the API doesn't know can be added to `data/item_overrides.csv`
 
 ### Running the collector in the background
 
-The simplest option is a terminal tab running `uv run wowgold collect`. For an unattended setup, a
-cron entry such as:
+The simplest option is a terminal tab running `uv run wowgold collect`. For an unattended setup, use
+cron with [scripts/collect-cron.sh](scripts/collect-cron.sh), which runs one cycle, appends output to
+`data/collect.log`, and skips a run if the previous one hasn't finished:
 
 ```
-5 * * * * cd /path/to/wow-forever && /path/to/uv run wowgold collect --once >> data/collect.log 2>&1
+5 * * * * /path/to/wow-forever-gold/scripts/collect-cron.sh
 ```
+
+Install it with `crontab -e`. On WSL, cron only runs while the WSL VM is up.
+
+### Collecting while your computer is off (GitHub Actions)
+
+Blizzard's API only serves the auction house as it is right now. An hour nobody fetched is gone,
+and you can't backfill it later. [.github/workflows/collect.yml](.github/workflows/collect.yml)
+fetches every house at :40 each hour on GitHub's servers. It uploads the raw snapshots as a workflow
+artifact, about 7 MB per hour, kept 30 days. That's free for public repositories, and the artifacts
+are public too, which is fine for auction data.
+
+1. Add the API credentials as repository secrets:
+   `gh secret set BLIZZARD_CLIENT_ID` and `gh secret set BLIZZARD_CLIENT_SECRET`.
+2. Get the workflow onto the default branch: scheduled workflows only run there. *Run workflow* in
+   the Actions tab triggers a first run by hand.
+3. Add `WOWGOLD_REMOTE_REPO=owner/name` to `.env`.
+
+The local collector then runs `wowgold remote sync` instead of fetching. It downloads the
+artifacts it hasn't seen (using `gh`'s login, or `WOWGOLD_GITHUB_TOKEN`), adds their snapshots
+oldest first, and ingests them. Hours collected while your machine was off fill in, as long as you
+sync within 30 days.
+
+Safety nets:
+- **Falling back to direct fetches:** if GitHub can't be reached, or no GitHub snapshot has arrived
+  in 2 hours, the collector fetches directly instead.
+- **Paused workflows:** GitHub pauses scheduled workflows after 60 days without commits; `sync`
+  switches it back on.
+- **Forcing a direct fetch:** `wowgold collect --direct` fetches from Blizzard no matter what.
+
+### Which auction house is yours
+
+Every ruleset (Normal, PvP, Roleplay, Roleplay PvP) has its own Alliance, Horde and Blackwater
+auction house, with separate listings and gold. The API lists all 15 houses under every ruleset,
+so it can't say which is which. Until you tell it, wowgold uses the busiest house of your
+faction, which may be another ruleset's market, and the Farms and Crafting pages say so.
+
+To confirm: list any cheap item in game at an unusual price (e.g. 1 Linen Cloth for 12g 34s
+56c), wait for the next hourly snapshot, then search for it on the **Houses** page or with
+`wowgold houses find "Linen Cloth" 12g34s56c`. Only your house has that listing; save it with
+*This is mine* / `wowgold houses mine <id>`. `WOWGOLD_HOUSES` in `.env` still overrides it.
+
+### Auction house rules used
+
+- **Cut:** 5% at faction houses, 15% at Blackwater (neutral) houses. These are Classic's rules;
+  Blizzard hasn't published Forever's.
+- **Prices** are per unit; buyers take the cheapest units first, across sellers (as in
+  Forever's AH window). "Market" is the average of the cheapest quarter of listings.
+- **Forever vendors:** items with a gold-only, unlimited vendor offer in your Wowhead captures
+  (e.g. the Black Market vendor Mister Graphed's reagents) are capped at that price, and
+  Crafting buys them there when it's cheaper than the AH.
+- **Not modelled:** deposits (refunded on a sale, lost when an auction expires or is
+  cancelled), and cancelled auctions count as sales in the sell-rate estimate, so sell rates of
+  heavily undercut items run somewhat high.
+- **Factions don't share listings:** Alliance and Horde houses are separate markets (checked:
+  no auction ID appears on both). Blackwater houses are the neutral ones.
+
+### Price trends
+
+Prices right after launch move fast, so today's price is a poor guide to what a farm's haul
+will fetch. From the collector's hourly history (last 7 days), every item gets:
+
+- **a trend**: the fitted price change per day, shown as an arrow next to sell rates on the
+  Farms, Crafting and New in Forever pages (`↓8%/d`; hover for the 24-hour and week-on-week
+  change and how much it swings);
+- **a selling price that follows the trend**: what you farm or craft is valued at where a
+  *falling* price will be in 2 days, when you'd sell it (shown as `→` under Market). A rising
+  price stays at today's price, since launch spikes tend to reverse. Buying materials uses
+  today's price.
+- **risk flags** on farms and crafts: "prices falling" and "prices swing a lot".
+
+Trends need history: nothing is adjusted under 1 day, adjustments count partly up to 3 days
+and fully after. A note at the top of each page says how much history the numbers rest on.
 
 ## Planning
 
@@ -84,6 +191,183 @@ Append to a file in `data/methods/` and run `wowgold methods check`:
   risk: [pvp, competition]
 ```
 
+## Discovering new farms
+
+`wowgold discover` looks for farms nobody has written down yet. It reads the
+[VMaNGOS](https://github.com/vmangos/core) vanilla 1.12 world database (GPL-2.0, ~140 MB;
+`wowgold vanilla fetch` downloads it into `data/vanilla/`) and prices what it finds at current
+AH prices:
+
+- **Mob camps.** Each hostile mob gets an expected value per kill: loot table × price, plus
+  coins. Spawns are grouped into ~450-yard squares; in each, you kill the most valuable mobs
+  first, limited by your kill speed (40/h at even level, faster when you out-level them) and
+  by respawn times. The best squares become candidates, with a skinning variant when the mobs
+  are skinnable.
+- **Gathering loops.** Per zone and profession, node pools tell how many herbs/veins are up at
+  once. Their spacing gives travel time per node, capped by each node type's respawn rate.
+
+Candidates are ordinary methods with `confidence: hypothesis`, scored by the same planner
+(AH cut, demand caps, mount and gear modifiers). Zones are inferred from node pools and quest
+objectives, so they're approximate.
+
+Kill speed depends on your class (`CLASS_KILL_SPEED` in `discovery/discover.py`: hunters
+and warlocks fastest, priests slowest), mages get an AoE bonus on mobs 5+ levels below them,
+and rogues add pickpocket loot from humanoids.
+
+```bash
+wowgold discover                         # uses your saved profile
+wowgold discover -l 45 -p skinning:225 --kind farm --top 20
+wowgold discover --levels 20-60          # best farms at 20, 25, ..., 60 while leveling
+wowgold discover --levels 15,30,45 --per-level 5
+wowgold discover --write                 # also writes data/discovered/hypotheses.yaml
+```
+
+A `--levels` sweep keeps your class, faction and professions, and assumes profession skill
+keeps pace with level: 5 points per level, never above what `--prof` says. Below 60 it also
+assumes leveling gear and no epic mount.
+
+To test one, copy its entry from `data/discovered/hypotheses.yaml` into a file in
+`data/methods/`, play it with the addon recording (or `wowgold session start <id>`), and import
+the session. Calibration then replaces the guessed yields with measured ones.
+
+**What it can't know:** vanilla drop rates, spawns and respawn times may differ in Forever, and
+Forever-only items (Scarce materials, new recipes) aren't in the data. White/grey weapons and
+armor and soulbound items are valued at vendor price only, which also hides troll listings.
+Fishing, pickpocketing and dungeons aren't covered yet.
+
+### Adding Forever-only items from Wowhead
+
+Forever-only items (Fel Crystal, Torbernite, Scarce materials, ...) aren't in the vanilla data,
+so `discover` can't see where they drop. You can look them up on Wowhead yourself and let
+wowgold save what the page shows:
+
+1. `wowgold ui`, then open http://127.0.0.1:8765/capture — a list of the most valuable
+   Forever-only items on your AH, linked to Wowhead.
+2. Install the userscript linked on that page in Tampermonkey or Violentmonkey (once).
+3. Click through the items. On each Wowhead page you open, the userscript reads the "Dropped by",
+   "Skinned from", "Mined from"... tables and posts them to the local server
+   (a green "wowgold: saved" badge confirms it). Pages are stored in `data/wowhead/captures/`.
+
+Nothing is fetched automatically: only pages you open are saved, at your browsing pace. The
+data is Wowhead's; keep it for personal use (it's gitignored) and don't redistribute it.
+
+`discover` then adds each drop chance to the matching vanilla mob or node, so a mob that now
+drops Fel Crystal can surface as a new camp.
+
+**Verifying farms.** On the Farms page, *Verify these farms on Wowhead* turns the farms on
+screen (a single level or a whole leveling sweep) into a capture to-do list: the Wowhead
+NPC page of each camp's mobs and the object page of each gathering loop's nodes, with the farms
+each page belongs to. A captured NPC/object page brings that mob's or node's Forever loot table.
+With 50+ samples it replaces the vanilla loot table outright (items Forever removed disappear),
+below that it only patches the items it lists. Re-run the search and fully covered farms show
+as *verified* (partly covered ones as e.g. *2/3 verified*).
+
+Sources without open-world spawn points in the vanilla data (NPCs new in Forever, or mobs that
+only live inside dungeons) become **leads**, listed under the farms. A lead is filtered like a
+farm: hostile to your faction, at most 2 levels above you, your class (pickpocketing is
+rogue-only), your skinning/gathering skill, and elites only with `--elites` (dungeon bosses
+never). Its "if plentiful" value counts only the captured items at your full kill speed, since
+there's no respawn data. Treat it as "worth a look", then measure it. `--leads N` sets how many
+to show; a `--levels` sweep shows the best lead per level.
+
+Leads are grouped by area:
+
+- **Same zone:** mobs in the same zone (or dungeon) are one lead. "Clearing all" kills whatever
+  comes up, weighted by spawn points when the mob's NPC page was captured (otherwise equally),
+  and adds up their drops. The headline is the better of that and farming the best mob alone.
+- **No zone known:** mobs whose zone isn't known (an item page lists them without one) group by
+  name family, e.g. *Twilight Peon* and *Twilight Grunt*. Check in game that they share a camp.
+- **Captured NPC pages:** a captured NPC page fills in the mob's level, zone and hostility.
+  With map positions (userscript v5) it becomes a real camp instead of a lead.
+
+Vanilla spawn points can alternate between up to five mobs (`id`..`id5` in the database).
+Each mob gets its share of the point's respawns.
+
+## Crafting
+
+**Getting every Forever recipe.** The Capture page has a *Recipes* checklist: Wowhead's
+list page for each profession (Alchemy, Blacksmithing, ... Cooking, First Aid) holds all its
+recipes with reagents, output, skill and trainer fee. Open those 9 pages with the userscript
+(version 2, which also matches `/forever/spells/...` pages) and the Crafting tab knows every
+recipe Wowhead lists. Revisit them after patches.
+
+Recipes come from the vanilla database (about 1,130 item-creating profession spells, with
+reagents, cooldowns, and how each is learned: trainer and fee, recipe item, or known from the
+start) plus Forever recipes from your Wowhead captures: the "Created by", "Reagent for" and
+"Teaches" tables on item pages you open. Forever data wins for the same recipe.
+
+**Buy, craft, sell.** For each recipe your skills can make (or all, with "show everything"):
+
+- materials at today's AH price, or a vendor's when cheaper (vendor stock is unlimited);
+- output at the AH price after the 5% cut, or vendor price when that's better (white
+  weapons/armor and soulbound items always at vendor);
+- crafts per day = the smallest of: your share of the output's daily sales, the materials
+  listed right now, the recipe's cooldown (transmutes, Mooncloth), and ~200 crafts of time;
+- learning cost (trainer fee, vendor or AH price of the recipe item) and how many crafts it
+  takes to pay back.
+
+**Craft what you farm.** For each material, the best recipe that turns it into more money than
+selling it raw, with the other materials bought, and how many a day the output market takes.
+On the Farms page, *Craft before selling* adds that to each farm's gold/h and re-ranks; the
+details say what to craft (e.g. "47 Sungrass → Invisibility Potion: 0.85g each instead of
+0.19g").
+
+Caveats: buying at the average price assumes you don't move the market; several materials
+feeding the same recipe each assume they get its full demand; Forever recipes from Wowhead
+have no cooldown data except transmutes (assumed 2 days).
+
+## New in Forever
+
+The **New in Forever** tab lists every item that isn't in the vanilla database, found on your
+auction house, in captured drop tables, Forever recipes, vendors and Wowhead item lists. Each
+has its price, sell rate and status:
+
+- **farmable:** a captured drop rate on a mob or node that spawns in the open world (it's
+  already part of the Farms page's camps);
+- **lead:** a drop rate from a mob without open-world spawns (new NPCs, dungeons);
+- **crafted:** a Forever recipe makes it (see the Crafting tab);
+- **vendor:** a Forever vendor sells it;
+- **source known, no rate:** a Wowhead item list names the mob or object, but its page isn't
+  captured yet; these pages are listed under *Pages to capture next*;
+- **seen in your play:** your addon loot log;
+- **source unknown:** nothing yet; capture its item page.
+
+*New drops on old mobs* highlights Forever items dropping from vanilla mobs, the cheapest new
+farms to test.
+
+**Names.** Blizzard's item API doesn't know many Forever items. Names come from your captures
+first, then from Wowhead's tooltip API (the endpoint sites use to embed tooltips): "Look them
+up on Wowhead" on the page, or `wowgold items wowhead-names`. It asks one item per second and
+stores every answer, so each item is looked up once. Blizzard's own names are never replaced.
+
+**Item lists.** Wowhead's item category pages (Trade Goods, Reagents, Consumables, Recipes,
+Miscellaneous, Quest items) say where each item comes from. Capture them with the userscript
+(version 4 also matches `/forever/items...`); links are on the New in Forever page.
+
+### Mobs that are new in Forever
+
+New mobs (and new zones like Riverglades) have no spawn data in the vanilla database, so on
+their own they're only leads. Capture the mob's Wowhead NPC page with userscript **v5** and it
+also sends the mob's map positions. wowgold then builds a real camp: the densest group of
+spawns on the zone map, kill speed for your class and level, the drop rates captured for it,
+and an assumed 6-minute respawn (Wowhead doesn't publish respawn times; coins aren't included
+either). These camps rank alongside the vanilla ones on the Farms page.
+
+### Keeping captures fresh
+
+Wowhead's samples grow and patches change drops, so the Capture page tracks age:
+
+- **Outdated captures:** older than 14 days (adjustable), or taken before your **patch mark**
+  (*New patch: mark all outdated* / `wowgold capture mark-patch` on patch day). They're listed
+  most-valuable-first: recipe and item lists, then NPC/object pages by what their drops trade
+  for (small Wowhead samples count double), then item pages. "Open next 10" works on them too;
+  a row is ticked once the page is captured again.
+- **What changed:** recapturing keeps the previous version (last 3) and lists new drops, drops
+  that disappeared, and rates that moved by 30%+ (and at least half a percentage point).
+- **New arrivals:** items listed on your AH for the first time in the past week (after the
+  collector's first hours) get a **NEW** badge on New in Forever, appear under *Just appeared
+  on the auction house* on the Capture page, and the hourly collector log names them.
+
 ## Measuring real yields
 
 Method yields start as estimates. Every session you log pulls them towards what you actually get
@@ -92,48 +376,60 @@ automatically.
 
 Save your character once with `wowgold profile set ...`. Then use any of these:
 
-**In-game addon (recommended): records automatically.** Copy `addon/WowGoldLogger` into the
-Forever client's `Interface/AddOns` folder. If it's listed as out of date, tick "Load out of date
-AddOns": the Forever interface version wasn't known when this was written. Then just play.
+**In-game addon (recommended): records the sessions you start.** Copy `addon/WowGoldLogger` into
+the Forever client's `Interface/AddOns` folder. If it's listed as out of date, tick "Load out of date
+AddOns": the Forever interface version wasn't known when this was written.
 
-The addon records, per stretch of play in one zone (a *segment*):
-- what you looted and **where it came from**: which NPC, or which herb node, ore vein or fishing
-  bobber;
-- which gathering spell opened the loot (Herb Gathering, Mining, Skinning, Fishing);
-- what you killed, and the coins you looted.
+The **minimap button** (a gold coin; drag it around the minimap) opens a small session panel:
+- **Controls:** a timer, and Start, Pause and Stop buttons.
+- **Totals:** raw gold (coins looted), kills and kills per hour, and what the items are worth at a
+  vendor. If Auctionator is installed, it also shows their auction value.
+- **Gold per hour:** a rough figure from those totals.
+- **Lists:** the top crafting materials, and notable loot (green or better, and recipes).
 
-A segment ends when you change zone or after 10 minutes without loot or kills. Active time is the
-time between loot/kill events, each gap capped at 5 minutes, so AFK time doesn't count.
+When you're not recording, it shows the last session. Right-clicking the button starts, pauses or
+resumes. The same controls work as commands:
 
 ```
-/wgl status                 what the current segment has recorded
-/wgl list                   recently finished segments
-/wgl pause  /  /wgl resume  stop recording entirely (e.g. while questing)
-/wgl start herb_felwood     optional: label what you're doing, which skips auto-matching
-/wgl stop                   end the label
+/wgl                   open/close the panel
+/wgl start [note]      start recording, e.g. /wgl start gryphons hillsbrad
+/wgl pause | resume    breaks
+/wgl stop              finish, then /reload (WoW only writes addon data to disk then)
+/wgl status            what's being recorded, in chat
+/wgl minimap           hide/show the minimap button
 ```
 
-After a `/reload` or logout, import:
+Nothing is recorded outside a session. During one, the addon keeps a raw, timestamped event log:
+- **kills:** each mob you or your pet killed, with its spawn ID and your map position, plus mobs
+  that died near you to someone else;
+- **loot:** loot windows with each slot's source (mob, node or chest) and item, what reached your
+  bags, and coins;
+- **activity:** combat start and end, your casts (gathering, eating), and your position every 5
+  seconds while moving;
+- **progress and money:** XP, level-ups, skill-ups, deaths, quest turn-ins, and your money total;
+- **header:** character, class, level, faction and professions.
 
-```bash
-uv run wowgold session import "/path/to/World of Warcraft/<forever folder>/WTF/Account/<ACCOUNT>/SavedVariables/WowGoldLogger.lua"
-```
+The hourly collector imports new sessions on its own. It looks in the usual WoW folders on C:
+(through WSL), or in `WOWGOLD_ADDON_FILE` if you set it. *Import now* on the **Sessions** page, or
+`wowgold session import <file>`, does it on demand. The Sessions page shows each session:
+- gold per active hour at today's prices;
+- kills per hour, and your kill speed against the model;
+- loot per mob next to what the loot model expects;
+- other players' kills around you, and respawn times you observed.
 
-On import, each segment is split into activities (herbalism, mining, skinning, fishing, killing).
-Each activity is then matched to the methods for that activity in that zone, by how much of the loot
-is the method's items. A beast's own loot counts towards the skinning route when you skinned it.
+What feeds back into the Farms page:
+- **Kill speed, per class:** the median of "the model's time per kill ÷ your time between kills"
+  over kills less than 3 minutes apart. It's pooled over sessions and pulled towards the model
+  until there are a good number of kills (30 kill-gaps' worth).
+- **Respawn times:** the same mob killed again at the same spot (within ~1.5% of the map). With 3
+  or more re-kills, the lower quartile of the gaps replaces vanilla's respawn, or the assumed 6
+  minutes for Forever mobs.
+- **Not your loot:** drop rates stay Wowhead's and the vanilla database's.
+- **Excluding a session:** mark it *Don't use for calibration* on its page, e.g. one spent
+  questing or in a group.
 
-- **Applied automatically:** one clear activity (≥70% of events), and one method covering ≥50% of
-  the loot and clearly ahead of the next candidate.
-- **Review:** mixed segments (e.g. herbing while killing satyrs) are split by events per activity.
-  Check them with `wowgold segments show <#>` and apply with `segments accept <#>`.
-- **Unmatched:** no method fits. `wowgold segments draft <#>` prints a method definition built from
-  what you actually got, ready to paste into `data/methods/`. Then
-  `wowgold segments assign <#> <new id>` uses the segment as its first measurement.
-- `segments assign <#> <method> [--activity kill]` overrides by hand; `segments ignore <#>` excludes
-  a segment.
-
-Re-importing the same file is safe.
+Older addon data (v0.2 segments) can still be imported and matched to methods with
+`wowgold segments`.
 
 **Timer.** `wowgold session start herb_felwood`, then `pause`/`resume`, then
 `wowgold session stop -i Dreamfoil:14 -i "Golden Sansam:6" --coins 2g10s`.
