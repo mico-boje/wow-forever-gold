@@ -1,5 +1,9 @@
 {# Which house the numbers come from, and a nudge when it's only a guess. Needs `r` with
    house_ids, house_source and book. #}
+{% set mat = r.book.maturity if r.book else none %}
+{% if mat and mat.level != "solid" %}
+<div class="note small" title="Prices come from the collector's hourly snapshots; trends need history to mean anything."><strong>{{ {"first-look": "First look", "early": "Early data", "settling": "Settling"}[mat.level] }}:</strong> {{ mat.describe() }}</div>
+{% endif %}
 {% if r.house_source == "guess" %}
 <div class="note warn small"><strong>House {{ r.house_ids | join(", ") }} is a guess</strong>: it's the busiest house of your faction, but every ruleset (Normal, PvP, Roleplay...) has its own auction house. <a href="/houses">Confirm yours</a> so these prices are your market's.</div>
 {% endif %}

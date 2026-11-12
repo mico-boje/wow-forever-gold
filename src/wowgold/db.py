@@ -142,6 +142,24 @@ CREATE TABLE IF NOT EXISTS addon_segments (
     imported_at  TEXT NOT NULL
 );
 
+-- Sessions recorded by the WowGoldLogger addon v3: a header and a raw event log, digested by
+-- wowgold.play on read.
+CREATE TABLE IF NOT EXISTS recordings (
+    id           TEXT PRIMARY KEY,   -- the addon's session id
+    started_at   TEXT NOT NULL,
+    stopped_at   TEXT,
+    char_name    TEXT,
+    realm        TEXT,
+    cls          TEXT,
+    level        INTEGER,
+    faction      TEXT,
+    note         TEXT,
+    n_events     INTEGER NOT NULL,
+    payload      TEXT NOT NULL,      -- JSON: header + events
+    hidden       INTEGER NOT NULL DEFAULT 0,  -- excluded from calibration
+    imported_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS session_items (
     session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     item_id     INTEGER NOT NULL,

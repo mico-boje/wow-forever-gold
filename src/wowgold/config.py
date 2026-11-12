@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     # Auction houses you trade on, e.g. WOWGOLD_HOUSES=[110,113]. Empty = all non-empty houses.
     wowgold_houses: list[int] = []
     wowgold_methods_dir: Path = Path("data/methods")
+    # The WowGoldLogger addon's SavedVariables file. Empty: look in the usual WoW folders
+    # (C: drive through WSL), e.g. .../WTF/Account/<ACCOUNT>/SavedVariables/WowGoldLogger.lua
+    wowgold_addon_file: Path | None = None
+    # GitHub repo ("owner/name") whose collect workflow snapshots the auction houses hourly.
+    # Set it and the local collector pulls those snapshots instead of fetching itself.
+    wowgold_remote_repo: str = ""
     # Versioned static namespace observed at launch; Blizzard's plain `static-forever-*`
     # has been reported to 403 at times, so we keep a fallback.
     wowgold_static_version: str = "1.60.1_70399"

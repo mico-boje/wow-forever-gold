@@ -1,29 +1,31 @@
--- WowGold Logger: records what you loot, where it came from and what you killed, so the
--- wowgold planner can work out which farm you were doing and measure its real yields.
+-- WowGold Logger: a session recorder for the wowgold planner.
 --
--- Recording is automatic. Activity is grouped into segments: a new segment starts when you
--- change zone or after IDLE_GAP seconds without loot or kills. The planner matches each
--- segment to a method on import (`wowgold session import`).
+-- Nothing is recorded until you start a session. While one runs, the addon writes a raw,
+-- timestamped event log (kills, loot windows, items received, coins, combat, casts, position,
+-- XP, deaths, money); the planner reads it and works out kill speed, respawn times,
+-- competition, drop rates and gold per hour.
 --
---   /wgl status              current segment
---   /wgl list                last finished segments
---   /wgl pause | resume      stop/continue recording entirely
---   /wgl start <method_id>   optional: label what you're doing (skips auto-matching)
---   /wgl stop                end the label (and the current segment)
+--   /wgl start [note]   start recording (the note is free text, e.g. "gryphons hillsbrad")
+--   /wgl pause | resume
+--   /wgl stop           finish the session, then /reload so WoW writes it to disk
+--   /wgl status         what's being recorded
+--   /wgl                open/close the session panel (also the minimap button)
+--   /wgl minimap        hide/show the minimap button
 --
--- Only reads loot/money/combat-log events; it never automates anything.
+-- Only reads game events; it never automates anything.
 
 local Logger = {}
 WowGoldLogger = Logger -- exposed for debugging and tests
 
+local VERSION = 3
 local PREFIX = "|cffe6c200WowGold|r "
-local IDLE_GAP = 10 * 60 -- seconds without activity that end a segment
-local ACTIVE_CAP = 5 * 60 -- longest gap between two events still counted as active time
-local LOOT_LINGER = 3 -- seconds after a loot window closes that loot is still attributed
-local SPELL_WINDOW = 10 -- a gathering cast this recent explains the next loot window
-local MAX_SEGMENTS = 1000
+local POS_INTERVAL = 5 -- seconds between position samples (only when you've moved)
+local STALE_AFTER = 30 * 60 -- a session untouched this long when you log in is finished
+local MAX_EVENTS = 200000 -- per session (~a long evening); recording stops beyond it
+local MAX_RECORDINGS = 200
 
-Logger.IDLE_GAP = IDLE_GAP
+Logger.VERSION = VERSION
+Logger.STALE_AFTER = STALE_AFTER
 
 local function say(msg)
     DEFAULT_CHAT_FRAME:AddMessage(PREFIX .. msg)
@@ -31,11 +33,7 @@ end
 
 -- Turn a GlobalStrings format ("You receive loot: %sx%d.") into an anchored Lua pattern.
 local function toPattern(fmt)
-    -- Escape magic characters (but not %, which only appears in placeholders).
     local p = fmt:gsub("[%(%)%.%+%-%*%?%[%]%^%$]", "%%%0")
-    -- Swap placeholders for marker bytes first, so captures inserted for one placeholder
-    -- (which contain "%d") aren't rewritten by the next substitution.
-    -- Positional forms used by some locales: %1$s (its $ is now escaped as %$).
     p = p:gsub("%%%d%%%$s", "\001"):gsub("%%%d%%%$d", "\002")
     p = p:gsub("%%s", "\001"):gsub("%%d", "\002")
     p = p:gsub("\001", "(.+)"):gsub("\002", "(%%d+)")
@@ -80,252 +78,375 @@ function Logger.parseMoney(msg)
     return total
 end
 
--- "Creature-0-4372-0-17-7105-0000ABCDEF" -> "Creature", 7105
+-- "Creature-0-4372-0-17-7105-0000ABCDEF" -> "Creature", 7105, "0000ABCDEF"
 function Logger.parseGuid(guid)
     if type(guid) ~= "string" then return nil end
-    local kind, id = guid:match("^(%a+)%-%d+%-%d+%-%d+%-%d+%-(%d+)%-")
+    local kind, id, uid = guid:match("^(%a+)%-%d+%-%d+%-%d+%-%d+%-(%d+)%-(%x+)$")
     if not kind then return nil end
-    return kind, tonumber(id)
+    return kind, tonumber(id), uid
 end
 
 local db -- WowGoldLoggerDB, set on ADDON_LOADED
-
--- Loot attribution state (not saved).
-local lootSource -- "Creature:7105", "GameObject:181270" or "unknown"
-local lootSourceUntil = 0 -- time() until which the last loot window's source still applies
-local lastSpell, lastSpellAt = nil, 0
+local rec -- the session being recorded (db.current), or nil
 
 local function now() return time() end
 
-local function zoneInfo()
+-- Event log -----------------------------------------------------------------------------
+-- Each event is one string: "<seconds since start>|<code>|<fields...>". Codes:
+--   Z zone|subzone|mapId     P mapId|x|y (percent)     C 1|0 combat start/end
+--   K npcId|spawnUid|x|y (you or your pet killed it)   D npcId|spawnUid (died near you)
+--   L kind|id|spawnUid|slots (loot window opened)      S slot|itemId|qty|kind|id|spawnUid
+--   I itemId|count (item received)    M copper (coins looted)    $ copper (money total)
+--   A spellId (your cast)    X xp gained    V level    T skill text    R dead|alive
+--   Q questId|xp|copper      U pause|resume|stop
+
+local function clean(v)
+    if v == nil then return "" end
+    return (tostring(v):gsub("|", "/"))
+end
+
+-- Running totals for the in-game panel (also rebuilt from the log, see Logger.summary).
+local function tally(sum, code, a, b)
+    if code == "K" then
+        sum.kills = sum.kills + 1
+    elseif code == "M" then
+        sum.copper = sum.copper + (tonumber(a) or 0)
+    elseif code == "I" then
+        local id = tonumber(a)
+        if id then sum.items[id] = (sum.items[id] or 0) + (tonumber(b) or 1) end
+    end
+end
+
+local function newSum() return { kills = 0, copper = 0, items = {} } end
+
+local function notify()
+    if Logger.onChange then Logger.onChange() end
+end
+
+local function log(code, ...)
+    if not rec or rec.paused then return end
+    if #rec.events >= MAX_EVENTS then
+        if not rec.full then
+            rec.full = true
+            say("session is full (" .. MAX_EVENTS .. " events): /wgl stop and start a new one")
+        end
+        return
+    end
+    local parts = { tostring(now() - rec.start), code }
+    for i = 1, select("#", ...) do parts[#parts + 1] = clean((select(i, ...))) end
+    rec.events[#rec.events + 1] = table.concat(parts, "|")
+    rec.last = now()
+    if code == "K" or code == "M" or code == "I" then
+        rec.sum = rec.sum or newSum()
+        tally(rec.sum, code, ...)
+        notify()
+    end
+end
+Logger.log = log
+
+-- Totals of a session (the current one or a saved one): kills, coins looted, items received.
+function Logger.summary(r)
+    if not r then return nil end
+    if not r.sum then
+        local sum = newSum()
+        for _, e in ipairs(r.events or {}) do
+            local _, code, a, b = e:match("^(%d+)|(.)|([^|]*)|?([^|]*)")
+            if code then tally(sum, code, a, b) end
+        end
+        r.sum = sum
+    end
+    return r.sum
+end
+
+local function round(x, digits)
+    local m = 10 ^ (digits or 0)
+    return math.floor(x * m + 0.5) / m
+end
+
+local lastPos = {}
+
+local function position()
     local mapId = C_Map and C_Map.GetBestMapForUnit and C_Map.GetBestMapForUnit("player")
-    return GetZoneText(), mapId
+    if not mapId or not C_Map.GetPlayerMapPosition then return mapId end
+    local pos = C_Map.GetPlayerMapPosition(mapId, "player")
+    if not pos then return mapId end
+    local x, y
+    if pos.GetXY then x, y = pos:GetXY() else x, y = pos.x, pos.y end
+    if not x or not y then return mapId end
+    return mapId, round(x * 100, 2), round(y * 100, 2)
+end
+Logger.position = position
+
+local function logPosition(force)
+    local mapId, x, y = position()
+    if not x then return end
+    if not force and lastPos.map == mapId and lastPos.x == x and lastPos.y == y then return end
+    lastPos.map, lastPos.x, lastPos.y = mapId, x, y
+    log("P", mapId, x, y)
 end
 
-local function closeSegment(reason)
-    local seg = db and db.open
-    if not seg then return end
-    db.open = nil
-    seg.closed = reason
-    if seg.active < 60 and not next(seg.sources) then return end -- nothing worth keeping
-    table.insert(db.segments, seg)
-    while #db.segments > MAX_SEGMENTS do table.remove(db.segments, 1) end
-end
-Logger.closeSegment = closeSegment
-
-local function newSegment(t)
-    local zone, mapId = zoneInfo()
-    local _, class = UnitClass("player")
-    db.open = {
-        id = string.format("%d-%04d", t, math.random(0, 9999)),
-        zone = zone,
-        map = mapId,
-        start = t,
-        last = t,
-        stop = t,
-        active = 0,
-        class = class,
-        level = UnitLevel("player"),
-        label = db.label,
-        sources = {},
-        kills = {},
-        copper = 0,
-    }
-    return db.open
+local function logZone()
+    local mapId = position()
+    log("Z", GetZoneText and GetZoneText() or "", GetSubZoneText and GetSubZoneText() or "", mapId)
 end
 
--- Current segment for an activity happening now; rolls over on zone change, idle gap or
--- label change.
-local function segment()
-    local t = now()
-    local seg = db.open
-    if seg then
-        local zone = GetZoneText()
-        if zone ~= seg.zone or t - seg.last > IDLE_GAP or seg.label ~= db.label then
-            closeSegment(zone ~= seg.zone and "zone" or (t - seg.last > IDLE_GAP and "idle" or "label"))
-            seg = nil
+-- Session header ------------------------------------------------------------------------
+
+local function professions()
+    local out = {}
+    if not GetNumSkillLines then return out end
+    for i = 1, GetNumSkillLines() do
+        local name, isHeader, _, rank, _, _, maxRank = GetSkillLineInfo(i)
+        if name and not isHeader then
+            out[#out + 1] = { name = name, rank = rank, max = maxRank }
         end
     end
-    seg = seg or newSegment(t)
-    seg.active = seg.active + math.min(t - seg.last, ACTIVE_CAP)
-    seg.last, seg.stop = t, t
-    return seg
+    return out
 end
 
-local function recording()
-    return db and not db.paused
+local function header()
+    local _, class = UnitClass("player")
+    local race
+    if UnitRace then _, race = UnitRace("player") end
+    return {
+        name = UnitName and UnitName("player"),
+        realm = GetRealmName and GetRealmName(),
+        class = class,
+        race = race,
+        level = UnitLevel("player"),
+        faction = UnitFactionGroup and UnitFactionGroup("player"),
+        skills = professions(),
+    }
 end
 
-local function source(seg, key)
-    local s = seg.sources[key]
-    if not s then
-        s = { loots = 0, items = {}, copper = 0 }
-        seg.sources[key] = s
+-- Commands -------------------------------------------------------------------------------
+
+local lastXp
+
+-- Recorded time of a session, without pauses.
+function Logger.elapsed(r)
+    r = r or rec
+    if not r then return 0 end
+    local paused = r.pausedFor or 0
+    if r.paused then paused = paused + (now() - r.paused) end
+    return math.max(0, (r.stop or now()) - r.start - paused)
+end
+local function elapsed() return Logger.elapsed(rec) end
+
+function Logger.current() return rec end
+function Logger.lastRecording() return db and db.recordings[#db.recordings] end
+function Logger.db() return db end
+
+function Logger.start(note)
+    if rec then return say("already recording (/wgl stop first)") end
+    local t = now()
+    rec = {
+        id = string.format("%d-%04d", t, math.random(0, 9999)),
+        v = VERSION,
+        note = note ~= "" and note or nil,
+        start = t,
+        last = t,
+        char = header(),
+        events = {},
+        kills = 0,
+        pausedFor = 0,
+        sum = newSum(),
+    }
+    db.current = rec
+    lastPos = {}
+    lastXp = UnitXP and UnitXP("player")
+    logZone()
+    logPosition(true)
+    if GetMoney then log("$", GetMoney()) end
+    say("recording" .. (rec.note and (" \"" .. rec.note .. "\"") or "") .. " (/wgl stop when done)")
+    notify()
+end
+
+function Logger.stop(reason)
+    if not rec then return say("not recording") end
+    if rec.paused then Logger.resume(true) end
+    if reason == "stale" then
+        -- found on login: the session really ended with its last event
+        rec.stop = rec.last or rec.start
+        rec.ended = "stale"
+    else
+        if GetMoney then log("$", GetMoney()) end
+        log("U", reason or "stop")
+        rec.stop = now()
     end
-    return s
-end
-
-local function currentSourceKey()
-    if lootSource and now() <= lootSourceUntil then return lootSource end
-    return "unknown"
-end
-
-function Logger.onLootOpened()
-    local key = "unknown"
-    if GetLootSourceInfo and GetNumLootItems and GetNumLootItems() > 0 then
-        local kind, id = Logger.parseGuid((GetLootSourceInfo(1)))
-        if kind then key = kind .. ":" .. id end
-    end
-    lootSource, lootSourceUntil = key, math.huge
-    if not recording() then return end
-    local s = source(segment(), key)
-    s.loots = s.loots + 1
-    if lastSpell and now() - lastSpellAt <= SPELL_WINDOW then
-        s.via = lastSpell
-        lastSpell = nil
-    end
-end
-
-function Logger.onLootClosed()
-    lootSourceUntil = now() + LOOT_LINGER
-end
-
-function Logger.onLoot(msg)
-    if not recording() then return end
-    local itemId, count = Logger.parseLoot(msg)
-    if not itemId then return end
-    local s = source(segment(), currentSourceKey())
-    s.items[itemId] = (s.items[itemId] or 0) + count
-end
-
-function Logger.onMoney(msg)
-    if not recording() then return end
-    local copper = Logger.parseMoney(msg)
-    if copper <= 0 then return end
-    local seg = segment()
-    seg.copper = seg.copper + copper
-    local s = source(seg, currentSourceKey())
-    s.copper = s.copper + copper
-end
-
-function Logger.onKill(sourceGuid, destGuid)
-    if not recording() then return end
-    if sourceGuid ~= UnitGUID("player") and sourceGuid ~= UnitGUID("pet") then return end
-    local kind, id = Logger.parseGuid(destGuid)
-    if kind ~= "Creature" then return end
-    local seg = segment()
-    seg.kills[id] = (seg.kills[id] or 0) + 1
-end
-
-function Logger.onSpell(spellId)
-    lastSpell, lastSpellAt = spellId, now()
-end
-
--- Commands ----------------------------------------------------------------------------
-
-local function describe(seg)
-    local items, kills = 0, 0
-    for _, s in pairs(seg.sources) do
-        for _, qty in pairs(s.items) do items = items + qty end
-    end
-    for _, n in pairs(seg.kills) do kills = kills + n end
-    return string.format("%s%s: %d min, %d items, %d kills, %s", seg.zone or "?",
-        seg.label and (" [" .. seg.label .. "]") or "", seg.active / 60, items, kills,
-        GetCoinText and GetCoinText(seg.copper, " ") or (seg.copper .. "c"))
-end
-
-function Logger.start(method)
-    if not method or method == "" then
-        return say("usage: /wgl start <method_id>  (see `wowgold methods list`)")
-    end
-    db.label = method
-    closeSegment("label")
-    say("labelling activity as " .. method .. " until /wgl stop")
-end
-
-function Logger.stop()
-    if not db.label then return say("no label set (recording is automatic)") end
-    closeSegment("label")
-    say("stopped labelling " .. db.label)
-    db.label = nil
+    table.insert(db.recordings, rec)
+    while #db.recordings > MAX_RECORDINGS do table.remove(db.recordings, 1) end
+    db.current = nil
+    local mins = elapsed() / 60
+    rec = nil
+    notify()
+    say(string.format("session saved (%d min). Type /reload to write it to disk for the planner.", mins))
 end
 
 function Logger.pause()
-    if db.paused then return say("already paused") end
-    closeSegment("pause")
-    db.paused = true
-    say("recording paused")
+    if not rec then return say("not recording") end
+    if rec.paused then return say("already paused") end
+    log("U", "pause")
+    rec.paused = now()
+    say("paused (/wgl resume)")
+    notify()
 end
 
-function Logger.resume()
-    if not db.paused then return say("not paused") end
-    db.paused = nil
-    say("recording resumed")
+function Logger.resume(quiet)
+    if not rec then return say("not recording") end
+    if not rec.paused then return say("not paused") end
+    rec.pausedFor = (rec.pausedFor or 0) + (now() - rec.paused)
+    rec.paused = nil
+    log("U", "resume")
+    logZone()
+    logPosition(true)
+    if not quiet then say("recording again") end
+    notify()
 end
 
 function Logger.status()
-    if db.paused then return say("recording paused (/wgl resume)") end
-    if not db.open then return say("no activity in the current segment yet") end
-    say("current: " .. describe(db.open))
-end
-
-function Logger.list()
-    local n = #db.segments
-    if n == 0 then return say("no finished segments") end
-    for i = math.max(1, n - 4), n do say(i .. ". " .. describe(db.segments[i])) end
+    if not rec then
+        return say(string.format("not recording; %d saved session(s). /wgl start [note]", #db.recordings))
+    end
+    say(string.format("%s%s: %d min, %d kills, %d events%s", rec.paused and "paused" or "recording",
+        rec.note and (" \"" .. rec.note .. "\"") or "", elapsed() / 60, rec.kills or 0, #rec.events,
+        rec.full and " (full)" or ""))
 end
 
 -- Events --------------------------------------------------------------------------------
+
+local function onCombatLog()
+    local _, subevent, _, sourceGuid, _, _, _, destGuid = CombatLogGetCurrentEventInfo()
+    if subevent ~= "PARTY_KILL" and subevent ~= "UNIT_DIED" then return end
+    local kind, id, uid = Logger.parseGuid(destGuid)
+    if kind ~= "Creature" and kind ~= "Vehicle" then return end
+    if subevent == "PARTY_KILL" then
+        if sourceGuid ~= UnitGUID("player") and sourceGuid ~= UnitGUID("pet") then return end
+        local _, x, y = position()
+        log("K", id, uid, x, y)
+        rec.kills = (rec.kills or 0) + 1
+        notify()
+    else
+        log("D", id, uid)
+    end
+end
+
+local function onLootOpened()
+    local n = GetNumLootItems and GetNumLootItems() or 0
+    local kind, id, uid = Logger.parseGuid(GetLootSourceInfo and n > 0 and (GetLootSourceInfo(1)) or nil)
+    log("L", kind, id, uid, n)
+    for slot = 1, n do
+        local link = GetLootSlotLink and GetLootSlotLink(slot)
+        local itemId = link and link:match("item:(%d+)")
+        local qty = 0
+        if GetLootSlotInfo then qty = select(3, GetLootSlotInfo(slot)) or 0 end
+        local sk, sid, suid = Logger.parseGuid(GetLootSourceInfo and (GetLootSourceInfo(slot)) or nil)
+        log("S", slot, itemId, qty, sk, sid, suid)
+    end
+end
 
 function Logger.onEvent(event, ...)
     local arg1 = ...
     if event == "ADDON_LOADED" and arg1 == "WowGoldLogger" then
         WowGoldLoggerDB = WowGoldLoggerDB or {}
         db = WowGoldLoggerDB
-        db.segments = db.segments or {}
-        db.sessions = db.sessions or {} -- v0.1 format, kept for import
-        db.version = 2
-        -- Close a segment left open if we were away longer than the idle gap.
-        if db.open and now() - db.open.last > IDLE_GAP then closeSegment("idle") end
-    elseif not db then
+        db.recordings = db.recordings or {}
+        db.version = VERSION
+        -- v0.2 kept recording automatically into db.segments/db.open; that's gone now.
+        db.open = nil
+        rec = db.current
+        if rec and now() - (rec.last or rec.start) > STALE_AFTER then
+            -- logged out (or crashed) mid-session a while ago: keep what's there
+            rec.paused = nil
+            Logger.stop("stale")
+        elseif rec then
+            say("still recording" .. (rec.note and (" \"" .. rec.note .. "\"") or "") .. " (/wgl stop when done)")
+        end
+        notify()
         return
+    end
+    if not rec or rec.paused then return end
+    if event == "COMBAT_LOG_EVENT_UNFILTERED" then
+        onCombatLog()
     elseif event == "LOOT_OPENED" then
-        Logger.onLootOpened()
-    elseif event == "LOOT_CLOSED" then
-        Logger.onLootClosed()
+        onLootOpened()
     elseif event == "CHAT_MSG_LOOT" then
-        Logger.onLoot(arg1)
+        local itemId, count = Logger.parseLoot(arg1)
+        if itemId then log("I", itemId, count) end
     elseif event == "CHAT_MSG_MONEY" then
-        Logger.onMoney(arg1)
+        local copper = Logger.parseMoney(arg1)
+        if copper > 0 then log("M", copper) end
+    elseif event == "PLAYER_MONEY" then
+        if GetMoney then log("$", GetMoney()) end
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         local unit, _, spellId = ...
-        if unit == "player" then Logger.onSpell(spellId) end
-    elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
-        local _, subevent, _, sourceGuid, _, _, _, destGuid = CombatLogGetCurrentEventInfo()
-        if subevent == "PARTY_KILL" then Logger.onKill(sourceGuid, destGuid) end
+        if unit == "player" then log("A", spellId) end
+    elseif event == "PLAYER_REGEN_DISABLED" then
+        log("C", 1)
+    elseif event == "PLAYER_REGEN_ENABLED" then
+        log("C", 0)
+    elseif event == "ZONE_CHANGED_NEW_AREA" or event == "ZONE_CHANGED" then
+        logZone()
+        logPosition(true)
+    elseif event == "PLAYER_XP_UPDATE" then
+        local xp = UnitXP and UnitXP("player")
+        if xp and lastXp and xp > lastXp then log("X", xp - lastXp) end
+        lastXp = xp
+    elseif event == "PLAYER_LEVEL_UP" then
+        log("V", arg1)
+        lastXp = 0
+    elseif event == "CHAT_MSG_SKILL" then
+        log("T", arg1)
+    elseif event == "PLAYER_DEAD" then
+        log("R", "dead")
+    elseif event == "PLAYER_ALIVE" or event == "PLAYER_UNGHOST" then
+        log("R", "alive")
+    elseif event == "QUEST_TURNED_IN" then
+        local questId, xp, money = ...
+        log("Q", questId, xp, money)
     end
 end
 
-local frame = CreateFrame("Frame")
-for _, e in ipairs({
-    "ADDON_LOADED", "LOOT_OPENED", "LOOT_CLOSED", "CHAT_MSG_LOOT", "CHAT_MSG_MONEY",
-    "UNIT_SPELLCAST_SUCCEEDED", "COMBAT_LOG_EVENT_UNFILTERED",
-}) do
-    frame:RegisterEvent(e)
+-- Position sampling: an OnUpdate timer, POS_INTERVAL seconds apart.
+local sinceSample = 0
+function Logger.onUpdate(elapsedSecs)
+    if not rec or rec.paused then return end
+    sinceSample = sinceSample + elapsedSecs
+    if sinceSample >= POS_INTERVAL then
+        sinceSample = 0
+        logPosition(false)
+        notify()
+    end
 end
-frame:SetScript("OnEvent", function(_, event, ...) Logger.onEvent(event, ...) end)
+
+local events = CreateFrame("Frame")
+for _, e in ipairs({
+    "ADDON_LOADED", "COMBAT_LOG_EVENT_UNFILTERED", "LOOT_OPENED", "CHAT_MSG_LOOT",
+    "CHAT_MSG_MONEY", "PLAYER_MONEY", "UNIT_SPELLCAST_SUCCEEDED", "PLAYER_REGEN_DISABLED",
+    "PLAYER_REGEN_ENABLED", "ZONE_CHANGED_NEW_AREA", "ZONE_CHANGED", "PLAYER_XP_UPDATE",
+    "PLAYER_LEVEL_UP", "CHAT_MSG_SKILL", "PLAYER_DEAD", "PLAYER_ALIVE", "PLAYER_UNGHOST",
+    "QUEST_TURNED_IN",
+}) do
+    events:RegisterEvent(e)
+end
+events:SetScript("OnEvent", function(_, event, ...) Logger.onEvent(event, ...) end)
+events:SetScript("OnUpdate", function(_, e) Logger.onUpdate(e) end)
 
 SLASH_WOWGOLDLOGGER1 = "/wgl"
 SlashCmdList["WOWGOLDLOGGER"] = function(input)
     local cmd, rest = (input or ""):match("^%s*(%S*)%s*(.-)%s*$")
     cmd = (cmd or ""):lower()
-    if cmd == "start" then Logger.start(rest)
+    if cmd == "start" then Logger.start(rest or "")
     elseif cmd == "stop" then Logger.stop()
     elseif cmd == "pause" then Logger.pause()
     elseif cmd == "resume" then Logger.resume()
     elseif cmd == "status" then Logger.status()
-    elseif cmd == "list" then Logger.list()
+    elseif cmd == "" or cmd == "show" or cmd == "hide" or cmd == "toggle" then
+        if Logger.ui then Logger.ui.panel(cmd == "" and "toggle" or cmd)
+        else say("/wgl start [note] | pause | resume | stop | status") end
+    elseif cmd == "minimap" then
+        if Logger.ui then Logger.ui.minimap() end
     else
-        say("recording is automatic. /wgl status | list | pause | resume | start <method> | stop")
+        say("/wgl (panel) | start [note] | pause | resume | stop | status | minimap (button on/off)")
     end
 end

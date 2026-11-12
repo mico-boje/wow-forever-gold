@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sqlite3
 import zipfile
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -267,15 +268,24 @@ class Spawn:
 
 
 def load_creature_spawns(conn: sqlite3.Connection, maps=CONTINENTS) -> list[Spawn]:
+    """Open-world creature spawn points. A spawn point can name up to five alternative
+    creatures (`id`, `id2`..`id5`) and picks one each time it respawns: each alternative gets
+    the point with `p_active` = its share of the picks."""
     marks = ",".join("?" * len(maps))
-    return [
-        Spawn(r[0], r[1], r[2], r[3], max((r[4] + r[5]) / 2, 30.0))
-        for r in conn.execute(
-            f"""SELECT id, map, position_x, position_y, spawntimesecsmin, spawntimesecsmax
-                FROM creature WHERE {IN_PATCH} AND map IN ({marks})""",
-            maps,
-        )
-    ]
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(creature)")]
+    alts = [c for c in ("id2", "id3", "id4", "id5") if c in cols]
+    out = []
+    for r in conn.execute(
+        f"""SELECT map, position_x, position_y, spawntimesecsmin, spawntimesecsmax,
+                   id{"".join(", " + c for c in alts)}
+            FROM creature WHERE {IN_PATCH} AND map IN ({marks})""",
+        maps,
+    ):
+        entries = [e for e in r[5:] if e]
+        respawn = max((r[3] + r[4]) / 2, 30.0)
+        for entry, n in Counter(entries).items():
+            out.append(Spawn(entry, r[0], r[1], r[2], respawn, n / len(entries)))
+    return out
 
 
 # -- gathering nodes ---------------------------------------------------------------------------

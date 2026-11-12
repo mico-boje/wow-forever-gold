@@ -39,6 +39,10 @@
            padding: 16px; }
   .note { padding: 10px 14px; border-radius: 8px; background: var(--chip); margin: 12px 0; }
   .note.warn { color: var(--warn); }
+  .trend { font-size: 12px; white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .trend.down { color: var(--bad); font-weight: 600; }
+  .trend.up { color: var(--ok); }
+  .trend.swing { color: var(--warn); }
   .note.bad { color: var(--bad); }
   .note.ok { color: var(--ok); }
   label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
@@ -78,6 +82,7 @@
       <a href="/farms" class="{{ 'on' if page == 'farms' }}">Farms</a>
       <a href="/crafting" class="{{ 'on' if page == 'crafting' }}">Crafting</a>
       <a href="/new" class="{{ 'on' if page == 'new' }}">New in Forever</a>
+      <a href="/sessions" class="{{ 'on' if page in ('sessions', 'session') }}">Sessions</a>
       <a href="/capture" class="{{ 'on' if page == 'capture' }}">Capture</a>
       <a href="/houses" class="{{ 'on' if page == 'houses' }}">Houses</a>
       <a href="/status" class="{{ 'on' if page == 'status' }}">Status</a>

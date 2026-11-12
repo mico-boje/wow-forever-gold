@@ -73,6 +73,11 @@ session_app = typer.Typer(
     help="Log play sessions to measure real yields per method.", no_args_is_help=True
 )
 app.add_typer(session_app, name="session")
+remote_app = typer.Typer(
+    help="Hourly snapshots collected on GitHub Actions while your computer is off.",
+    no_args_is_help=True,
+)
+app.add_typer(remote_app, name="remote")
 console = Console()
 
 RegionOpt = Annotated[str | None, typer.Option("--region", "-r", help="us | eu | kr | tw")]
@@ -343,6 +348,46 @@ def houses_mine(
 OVERRIDES_FILE = "item_overrides.csv"
 
 
+REMOTE_STALE_H = 2
+
+
+def _remote_sync(conn, s: Settings) -> bool:
+    """Pull snapshots from the GitHub Actions collector. False if that failed (the caller
+    then fetches directly, so the hour isn't lost)."""
+    from .remote import sync
+
+    try:
+        r = sync(conn, s.wowgold_data_dir, s.wowgold_remote_repo)
+    except Exception as exc:  # GitHub unreachable, token missing, ...
+        console.print(f"[yellow]GitHub sync failed ({exc!r}); fetching directly instead[/]")
+        return False
+    console.print(
+        f"GitHub snapshots: {r.artifacts} run(s) downloaded, {r.stored} stored, "
+        f"{r.unchanged} unchanged, {r.skipped} older than what's here"
+        + (f", {r.pending} more next time" if r.pending else "")
+    )
+    for note in r.notes:
+        console.print(f"  [yellow]{note}[/]")
+    # Nothing new from GitHub for a while (workflow paused, failing or not set up yet):
+    # fetch directly rather than leave a hole.
+    from datetime import UTC, datetime, timedelta
+
+    latest = conn.execute("SELECT MAX(fetched_at) FROM snapshots").fetchone()[0]
+    if (
+        not r.stored
+        and not r.unchanged
+        and (
+            latest is None
+            or datetime.fromisoformat(latest) < datetime.now(UTC) - timedelta(hours=REMOTE_STALE_H)
+        )
+    ):
+        console.print(
+            f"[yellow]No GitHub snapshot in the last {REMOTE_STALE_H} hours; fetching directly[/]"
+        )
+        return False
+    return True
+
+
 def _ingest(conn) -> None:
     summary = ingest_pending(conn)
     console.print(
@@ -457,8 +502,14 @@ def collect(
     once: Annotated[bool, typer.Option(help="Run a single cycle and exit.")] = False,
     keep_raw: Annotated[int, typer.Option(help="Raw snapshots to keep per house/kind.")] = 2,
     keep_hourly_days: Annotated[int, typer.Option(help="Days of hourly stats to keep.")] = 14,
+    direct: Annotated[
+        bool, typer.Option(help="Fetch from the Blizzard API even if WOWGOLD_REMOTE_REPO is set.")
+    ] = False,
 ) -> None:
-    """Snapshot -> ingest -> item sync -> prune, repeated every N minutes."""
+    """Snapshot -> ingest -> item sync -> prune, repeated every N minutes.
+
+    With WOWGOLD_REMOTE_REPO set, the snapshots come from the GitHub Actions collector
+    (`wowgold remote sync`), including any hours collected while this machine was off."""
     import time
     from datetime import UTC, datetime
 
@@ -469,17 +520,19 @@ def collect(
         conn = db.connect(s.db_path)
         try:
             with _client(s, region) as client:
-                summary = run_snapshot(ForeverApi(client), conn, s.wowgold_data_dir)
-                console.print(
-                    f"Snapshot: {summary.stored} stored, {summary.unchanged} unchanged, "
-                    f"{summary.not_modified} not modified, {len(summary.errors)} errors"
-                )
-                for err in summary.errors:
-                    console.print(f"  [red]{err}[/]")
+                if not (s.wowgold_remote_repo and not direct and _remote_sync(conn, s)):
+                    summary = run_snapshot(ForeverApi(client), conn, s.wowgold_data_dir)
+                    console.print(
+                        f"Snapshot: {summary.stored} stored, {summary.unchanged} unchanged, "
+                        f"{summary.not_modified} not modified, {len(summary.errors)} errors"
+                    )
+                    for err in summary.errors:
+                        console.print(f"  [red]{err}[/]")
                 cycle_start = datetime.now(UTC).isoformat(timespec="seconds")
                 _ingest(conn)
                 _sync_items(conn, client, s.wowgold_data_dir)
                 _report_new_items(conn, region or s.wowgold_region, cycle_start)
+                _import_recordings(conn, s)
                 _prune(conn, keep_raw, keep_hourly_days)
         except BlizzardAuthError as exc:
             console.print(f"[red]{exc}[/]")
@@ -943,6 +996,21 @@ def session_cancel() -> None:
     console.print("Timer discarded.")
 
 
+def _import_recordings(conn, s, *, force: bool = False) -> None:
+    """Pick up sessions the WowGoldLogger addon recorded (files changed since last time)."""
+    from .play.recordings import auto_import
+
+    res = auto_import(conn, s.wowgold_data_dir, s.wowgold_addon_file, force=force)
+    for err in res.errors:
+        console.print(f"  [yellow]addon file: {err}[/]")
+    if res.read:
+        r = res.result
+        console.print(
+            f"Addon sessions: {r.new} new, {r.updated} updated, {r.unchanged} unchanged "
+            f"({len(res.read)} file(s))"
+        )
+
+
 @session_app.command("import")
 def session_import(
     path: Annotated[
@@ -952,15 +1020,33 @@ def session_import(
 ) -> None:
     """Import what the WowGoldLogger addon recorded (safe to re-run).
 
-    Segments that clearly match one method are applied automatically; mixed or unclear
-    ones are listed for review (`wowgold segments`)."""
+    Addon v3 sessions (/wgl start ... stop) are stored for the Sessions page and calibration;
+    the collector also picks them up automatically. Older v0.2 segments that clearly match
+    one method are applied; unclear ones are listed for review (`wowgold segments`)."""
     from pathlib import Path
 
+    from .play import recordings
+
     s = get_settings()
+    file = Path(path).expanduser()
+    try:
+        recs = recordings.read_file(file)
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(f"can't read {path}: {exc}") from exc
+    if recs:
+        conn = db.connect(s.db_path)
+        try:
+            r = recordings.store(conn, recs)
+        finally:
+            conn.close()
+        console.print(
+            f"Recorded sessions (addon v3): {r.new} new, {r.updated} updated, "
+            f"{r.unchanged} unchanged. See them in `wowgold ui` (Sessions)."
+        )
     methods = {m.id: m for m in load_methods(s.wowgold_methods_dir)}
     profile = _resolve_profile(s, None, None, None, None, None, None)
     try:
-        data = read_addon_file(Path(path).expanduser())
+        data = read_addon_file(file)
     except (OSError, ValueError) as exc:
         raise typer.BadParameter(f"can't read {path}: {exc}") from exc
     conn = db.connect(s.db_path)
@@ -987,10 +1073,12 @@ def session_import(
         )
     for msg in summary.skipped:
         console.print(f"  [yellow]skipped {msg}[/]")
-    console.print(
-        f"Segments: {len(summary.segments)} new, {summary.segment_duplicates} already imported"
-        + (" (one still in progress, import it next time)" if data.open_segment else "")
-    )
+    if data.segments or data.open_segment:
+        console.print(
+            f"Segments (addon v0.2): {len(summary.segments)} new, "
+            f"{summary.segment_duplicates} already imported"
+            + (" (one still in progress, import it next time)" if data.open_segment else "")
+        )
     if summary.segments:
         _segment_table([(r.row_id, r.segment, r.proposal, None) for r in summary.segments])
     review = [r for r in summary.segments if r.proposal.status in ("review", "unmatched")]
@@ -1560,8 +1648,14 @@ def _print_leads(found, title: str, levels: list[int] | None = None) -> None:
             for i in lead.items[:3]
         )
         row = [str(levels[n])] if levels else []
+        if len(lead.members) > 1:
+            mobs = ", ".join(m.source.source_name for m in lead.members[:4])
+            more = f" +{len(lead.members) - 4}" if len(lead.members) > 4 else ""
+            name = f"{lead.title}\n[dim]{mobs}{more}[/]"
+        else:
+            name = f"{src.source_name}\n[dim]{what} · {src.source_type} {src.source_id} {lvl}[/]"
         row += [
-            f"{src.source_name}\n[dim]{what} · {src.source_type} {src.source_id} {lvl}[/]",
+            name,
             ", ".join(lead.zones[:2]) or "?",
             drops,
             f"{_gold(lead.gold_per_hour)}/h",
@@ -1966,3 +2060,57 @@ def capture_mark_patch() -> None:
     s = get_settings()
     settings = mark_patch(s.wowgold_data_dir)
     console.print(f"Captures before {settings['stale_before']} are now outdated.")
+
+
+@remote_app.command("export")
+def remote_export(
+    out: Annotated[str, typer.Argument(help="Folder to write raw snapshots + manifest.json to.")],
+    region: RegionOpt = None,
+) -> None:
+    """Fetch every auction house once into a folder (what the GitHub workflow uploads)."""
+    from pathlib import Path
+
+    from .remote import export_snapshot
+
+    s = get_settings()
+    with _client(s, region) as client:
+        summary = export_snapshot(ForeverApi(client), Path(out))
+    console.print(
+        f"Snapshot: {summary.stored} stored, {summary.unchanged} unchanged, "
+        f"{len(summary.errors)} errors"
+    )
+    for err in summary.errors:
+        console.print(f"  [red]{err}[/]")
+    if not summary.stored:
+        raise typer.Exit(1)
+
+
+@remote_app.command("sync")
+def remote_sync(
+    repo: Annotated[
+        str | None, typer.Option(help="owner/name; default WOWGOLD_REMOTE_REPO.")
+    ] = None,
+    ingest: Annotated[bool, typer.Option(help="Ingest what was downloaded.")] = True,
+) -> None:
+    """Download the GitHub collector's snapshots you don't have yet (safe to re-run)."""
+    from .remote import sync
+
+    s = get_settings()
+    repo = repo or s.wowgold_remote_repo
+    if not repo:
+        raise typer.BadParameter("set WOWGOLD_REMOTE_REPO in .env or pass --repo owner/name")
+    conn = db.connect(s.db_path)
+    try:
+        r = sync(conn, s.wowgold_data_dir, repo)
+        console.print(
+            f"{r.artifacts} run(s) downloaded: {r.stored} snapshots stored, {r.unchanged} "
+            f"unchanged, {r.skipped} older than what's here"
+            + (f"; {r.pending} more runs next time" if r.pending else "")
+            + (f". Workflow: {r.workflow}" if r.workflow else "")
+        )
+        for note in r.notes:
+            console.print(f"  [yellow]{note}[/]")
+        if ingest:
+            _ingest(conn)
+    finally:
+        conn.close()

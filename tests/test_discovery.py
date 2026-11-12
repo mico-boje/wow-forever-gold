@@ -503,8 +503,12 @@ def test_leads_from_unplaceable_sources(world, book):
     assert imp.gold_per_hour > 0
 
     with_elites = find_leads(data, unplaced, prof, book, PlanOptions(), elites=True)
-    assert "Big Elite" in [lead.source.source_name for lead in with_elites]
-    assert "Dungeon Boss" not in [lead.source.source_name for lead in with_elites]
+    members = [m.source.source_name for lead in with_elites for m in lead.members]
+    assert "Big Elite" in members and "Dungeon Boss" not in members
+    # same zone: the elite joins the Fel Imp's lead
+    felwood = next(lead for lead in with_elites if lead.grouped_by == "zone")
+    assert felwood.title == "2 mobs in Felwood"
+    assert {m.source.source_name for m in felwood.members} == {"Fel Imp", "Big Elite"}
 
 
 def test_instance_only_vanilla_mob_is_a_lead(world, book, tmp_path):
@@ -561,3 +565,72 @@ def test_replaced_table_keeps_drops_too_rare_for_the_sample(world, book):
     items = {i.item for i in camp.method.yields}
     assert items == {HERB, PATTERN}
     assert camp.verified == 1
+
+
+def test_spawn_points_with_alternative_mobs(tmp_path):
+    from wowgold.discovery import vanilla as v
+
+    c = sqlite3.connect(tmp_path / "s.sqlite")
+    c.execute(
+        "CREATE TABLE creature (guid INT, id INT, id2 INT, id3 INT, id4 INT, id5 INT, map INT, "
+        "position_x REAL, position_y REAL, spawntimesecsmin INT, spawntimesecsmax INT, "
+        "patch_min INT, patch_max INT)"
+    )
+    # one point alternating between mobs 10 and 20; one point that's always 10
+    c.execute("INSERT INTO creature VALUES (1, 10, 20, 0, 0, 0, 0, 1, 1, 300, 300, 0, 10)")
+    c.execute("INSERT INTO creature VALUES (2, 10, 0, 0, 0, 0, 0, 2, 2, 300, 300, 0, 10)")
+    c.commit()
+    got = sorted((s.entry, s.x, s.p_active) for s in v.load_creature_spawns(c))
+    assert got == [(10, 1, 0.5), (10, 2, 1.0), (20, 1, 0.5)]
+
+
+def test_leads_group_by_zone_and_name(world, book):
+    from wowgold.discovery.discover import find_leads
+    from wowgold.wowhead.entities import Entity, EntityInfo, MapPoint
+    from wowgold.wowhead.sources import ItemSource
+
+    fel = 248819
+    book.prices[fel] = _price(fel, market=400000, listed=100000, vendor_sell=0, name="Fel Crystal")
+    data = VanillaData.load(world)
+
+    def src(sid, name, chance, zones=(361,), **kw):
+        kw = {"level": (50, 51), "react": (-1, -1), **kw}
+        return ItemSource(fel, "drop", "npc", sid, name, chance, 500, zones, **kw)
+
+    _, unplaced = data.add_sources(
+        [
+            src(900001, "Fel Imp", 0.10),
+            src(900002, "Fel Hound", 0.02),
+            src(900003, "Twilight Peon", 0.05, zones=()),
+            src(900004, "Twilight Grunt", 0.05, zones=()),
+            src(900005, "Lonely Ogre", 0.05, zones=()),
+            # an item page without the zone; the NPC page (captured) has it
+            src(900006, "Fel Stalker", 0.04, zones=(), level=None),
+        ]
+    )
+    entities = {
+        ("npc", 900006): Entity(
+            EntityInfo("npc", 900006, "Fel Stalker", (50, 51), (-1, -1), zones=(361,)),
+            [MapPoint(361, "Felwood", 10, 10)] * 3,
+        )
+    }
+    leads = find_leads(data, unplaced, profile(), book, PlanOptions(), entities=entities)
+    by_title = {lead.title: lead for lead in leads}
+    assert set(by_title) == {"3 mobs in Felwood", "Twilight mobs (2, zone unknown)", "Lonely Ogre"}
+
+    fw = by_title["3 mobs in Felwood"]
+    assert [m.source.source_name for m in fw.members] == ["Fel Imp", "Fel Stalker", "Fel Hound"]
+    assert fw.members[1].spawns == 3
+    # clearing the area is worth less per hour than farming only the imps here
+    imp_alone = fw.members[0].gold_per_hour
+    assert fw.mix_per_hour < imp_alone and fw.gold_per_hour == imp_alone
+    assert any("Fel Imp alone" in f for f in fw.flags)
+    # units per hour in the mix = kills/h × weighted chance
+    (item,) = fw.items
+    weights = {900001: 3, 900002: 3, 900006: 3}  # unknown spawns take the known median
+    rates = {m.source.source_id: m.rate for m in fw.members}
+    cycles = 1 / sum(weights[i] / rates[i] for i in weights)
+    assert item.per_hour == pytest.approx(cycles * 3 * (0.10 + 0.02 + 0.04))
+
+    tw = by_title["Twilight mobs (2, zone unknown)"]
+    assert tw.grouped_by == "name" and "grouped by name" in tw.flags[0]

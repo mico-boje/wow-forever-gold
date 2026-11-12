@@ -23,6 +23,8 @@ from ..market.myhouse import house_source, load_my_houses
 from ..planner.engine import PlanOptions
 from ..planner.pricing import PriceBook, build_price_book, cap_prices, pick_houses
 from ..planner.profile import CharacterProfile
+from ..play.calibration import Calibration
+from ..play.calibration import build as build_calibration
 from ..wowhead.capture import captured
 from ..wowhead.entities import load_entities
 from ..wowhead.itemlists import load_item_hints
@@ -118,6 +120,7 @@ class DiscoverResult:
     book: PriceBook | None = None  # prices and sell rates the farms were scored with
     capped: dict[int, VendorOffer] = field(default_factory=dict)  # AH prices capped by vendors
     house_source: str = "guess"  # chosen | configured | confirmed | guess
+    calibration: Calibration | None = None  # from your recorded sessions
 
     @property
     def hidden_elite_leads(self) -> int:
@@ -152,6 +155,10 @@ def run_discover(
     house_ids = pick_houses(conn, region, profile.faction, house, configured_houses, mine)
     if not house_ids:
         raise LookupError("no auction data for that faction; run `wowgold collect --once`")
+    # Your recorded sessions: measured kill speed and respawn times
+    calibration = build_calibration(conn, data)
+    data.respawn = {npc: r.seconds for npc, r in calibration.respawns.items()}
+    profile = profile.model_copy(update={"kill_speed": calibration.speed(profile.cls)})
     recipes, ctx = [], None
     if craft:
         recipes, ctx, _ = cache.crafting()
@@ -163,6 +170,13 @@ def run_discover(
         ctx = ctx.with_offers(offers)
     craft_opts = CraftOptions(sell_days=opts.sell_days, market_share=opts.market_share)
     entities = load_entities(cache.data_dir)
+    # Forever zones aren't in the vanilla area table; Wowhead's map data names them
+    zone_names = {
+        p.zone_id: p.zone_name
+        for e in entities.values()
+        for p in e.points
+        if p.zone_id is not None and p.zone_name
+    }
     out = DiscoverResult(
         profile=profile,
         house_ids=house_ids,
@@ -175,6 +189,7 @@ def run_discover(
         house_source=house_source(
             house_ids, profile.faction, explicit=house, configured=configured_houses, mine=mine
         ),
+        calibration=calibration,
     )
     for level in levels or [profile.level]:
         at = profile_at_level(profile, level) if levels else profile
@@ -192,7 +207,16 @@ def run_discover(
         lead_sources = [
             u for u in unplaced if not (u.source_type == "npc" and u.source_id in camp_npcs)
         ]
-        found = find_leads(data, lead_sources, at, book, opts, elites=elites)[:leads]
+        found = find_leads(
+            data,
+            lead_sources,
+            at,
+            book,
+            opts,
+            elites=elites,
+            entities=entities,
+            zone_names=zone_names,
+        )[:leads]
         out.results.append(LevelResult(at, farms, found))
     return out
 
@@ -271,6 +295,7 @@ class NewItemsResult:
     house_ids: list[int]
     house_source: str
     names_added: int
+    book: PriceBook | None = None
 
 
 def run_new_items(
@@ -324,6 +349,7 @@ def run_new_items(
     )
     return NewItemsResult(
         overview=overview,
+        book=book,
         house_ids=house_ids,
         house_source=house_source(
             house_ids, faction, explicit=house, configured=configured_houses, mine=mine

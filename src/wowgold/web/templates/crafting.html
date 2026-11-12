@@ -44,7 +44,7 @@
 {% endblock %}
 
 {% macro rate_span(item_id) -%}
-  {%- if rate %}{% set r = rate(item_id) %}<span class="rate" title="{{ 'Sold per day (measured)' if r.measured else 'Estimated sales per day (from listings)' }}">{{ r.label() }}</span>{% endif -%}
+  {%- if rate %}{% set r = rate(item_id) %}<span class="rate" title="{{ 'Sold per day (measured)' if r.measured else 'Estimated sales per day (from listings)' }}">{{ r.label() }}</span>{% if r.trend_label() %} <span class="trend {{ r.trend_class }}" title="{{ r.trend_title() }}">{{ r.trend_label() }}</span>{% endif %}{% endif -%}
 {%- endmacro %}
 
 {% block main %}

@@ -10,7 +10,7 @@
   .items { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
            overflow: hidden; }
   .i-head, .it > summary { display: grid; gap: 12px; align-items: baseline; padding: 9px 14px;
-    grid-template-columns: minmax(0, 1.6fr) 80px 90px 120px minmax(0, 2fr); }
+    grid-template-columns: minmax(0, 1.6fr) 120px 90px 120px minmax(0, 2fr); }
   .i-head { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase;
             letter-spacing: .04em; border-bottom: 1px solid var(--line); }
   .it { border-bottom: 1px solid var(--line); }
@@ -109,7 +109,7 @@
     <details class="it">
       <summary>
         <span><strong>{{ it.name }}</strong>{% if it.is_new %} <span class="chip st-new" title="First listed on your auction house {{ it.first_seen }}">NEW</span>{% endif %}{% if it.used_in %} <span class="chip" title="Forever recipes that use it">in {{ it.used_in }} recipe{{ "s" if it.used_in > 1 }}</span>{% endif %}</span>
-        <span class="r">{{ it.market | gold if it.market else "—" }}</span>
+        <span class="r">{{ it.market | gold if it.market else "—" }}{% if rate and it.market %}{% set r = rate(it.item_id) %}{% if r.trend_label() %} <span class="trend {{ r.trend_class }}" title="{{ r.trend_title() }}">{{ r.trend_label() }}</span>{% endif %}{% endif %}</span>
         <span class="r">{% if it.sold_per_day is not none %}{{ "" if it.measured else "~" }}{{ "%.1f" | format(it.sold_per_day) if it.sold_per_day < 10 else it.sold_per_day | round | int }}{% else %}<span class="muted">not listed</span>{% endif %}</span>
         <span>{{ status_chip(it.status) }}</span>
         <span class="small">{{ it.sources[0].text if it.sources else "" }}{% if it.sources | length > 1 %} <span class="muted">+{{ it.sources | length - 1 }}</span>{% endif %}</span>

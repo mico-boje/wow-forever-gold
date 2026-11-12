@@ -59,7 +59,7 @@ in your Windows browser (WSL forwards localhost).
 | `wowgold new-items` | Items new in Forever: price, sell rate and known sources, most valuable first. |
 | `wowgold items wowhead-names` | Look up names of new items on Wowhead's tooltip API (1 per second, cached). |
 | `wowgold capture outdated` / `capture mark-patch` | List outdated Wowhead captures; after a patch, mark everything outdated. |
-| `wowgold ui` | Local web UI: farms, leveling sweep, leads, Wowhead capture, collector status. |
+| `wowgold ui` | Local web UI: farms, leveling sweep, leads, crafting, recorded sessions, Wowhead capture, collector status. |
 | `wowgold capture serve` | Same as `wowgold ui`, opening on the Capture page. |
 | `wowgold capture sources` | Item sources parsed from your captures, and whether `discover` can use them. |
 | `wowgold prune` | Delete old raw files (keeps 2 per house) and roll hourly stats older than 14 days into daily rows. |
@@ -80,6 +80,32 @@ cron with [scripts/collect-cron.sh](scripts/collect-cron.sh), which runs one cyc
 ```
 
 Install it with `crontab -e`. On WSL, cron only runs while the WSL VM is up.
+
+### Collecting while your computer is off (GitHub Actions)
+
+Blizzard's API only serves the auction house as it is right now. An hour nobody fetched is gone,
+and you can't backfill it later. [.github/workflows/collect.yml](.github/workflows/collect.yml)
+fetches every house at :40 each hour on GitHub's servers. It uploads the raw snapshots as a workflow
+artifact, about 7 MB per hour, kept 30 days. That's free for public repositories, and the artifacts
+are public too, which is fine for auction data.
+
+1. Add the API credentials as repository secrets:
+   `gh secret set BLIZZARD_CLIENT_ID` and `gh secret set BLIZZARD_CLIENT_SECRET`.
+2. Get the workflow onto the default branch: scheduled workflows only run there. *Run workflow* in
+   the Actions tab triggers a first run by hand.
+3. Add `WOWGOLD_REMOTE_REPO=owner/name` to `.env`.
+
+The local collector then runs `wowgold remote sync` instead of fetching. It downloads the
+artifacts it hasn't seen (using `gh`'s login, or `WOWGOLD_GITHUB_TOKEN`), adds their snapshots
+oldest first, and ingests them. Hours collected while your machine was off fill in, as long as you
+sync within 30 days.
+
+Safety nets:
+- **Falling back to direct fetches:** if GitHub can't be reached, or no GitHub snapshot has arrived
+  in 2 hours, the collector fetches directly instead.
+- **Paused workflows:** GitHub pauses scheduled workflows after 60 days without commits; `sync`
+  switches it back on.
+- **Forcing a direct fetch:** `wowgold collect --direct` fetches from Blizzard no matter what.
 
 ### Which auction house is yours
 
@@ -105,6 +131,25 @@ To confirm: list any cheap item in game at an unusual price (e.g. 1 Linen Cloth 
 - **Not modelled:** deposits (refunded on a sale, lost when an auction expires or is
   cancelled), and cancelled auctions count as sales in the sell-rate estimate, so sell rates of
   heavily undercut items run somewhat high.
+- **Factions don't share listings:** Alliance and Horde houses are separate markets (checked:
+  no auction ID appears on both). Blackwater houses are the neutral ones.
+
+### Price trends
+
+Prices right after launch move fast, so today's price is a poor guide to what a farm's haul
+will fetch. From the collector's hourly history (last 7 days), every item gets:
+
+- **a trend**: the fitted price change per day, shown as an arrow next to sell rates on the
+  Farms, Crafting and New in Forever pages (`↓8%/d`; hover for the 24-hour and week-on-week
+  change and how much it swings);
+- **a selling price that follows the trend**: what you farm or craft is valued at where a
+  *falling* price will be in 2 days, when you'd sell it (shown as `→` under Market). A rising
+  price stays at today's price, since launch spikes tend to reverse. Buying materials uses
+  today's price.
+- **risk flags** on farms and crafts: "prices falling" and "prices swing a lot".
+
+Trends need history: nothing is adjusted under 1 day, adjustments count partly up to 3 days
+and fully after. A note at the top of each page says how much history the numbers rest on.
 
 ## Planning
 
@@ -182,7 +227,7 @@ keeps pace with level: 5 points per level, never above what `--prof` says. Below
 assumes leveling gear and no epic mount.
 
 To test one, copy its entry from `data/discovered/hypotheses.yaml` into a file in
-`data/methods/`, play it with the addon running (or `wowgold session start <id>`), and import
+`data/methods/`, play it with the addon recording (or `wowgold session start <id>`), and import
 the session. Calibration then replaces the guessed yields with measured ones.
 
 **What it can't know:** vanilla drop rates, spawns and respawn times may differ in Forever, and
@@ -224,6 +269,19 @@ rogue-only), your skinning/gathering skill, and elites only with `--elites` (dun
 never). Its "if plentiful" value counts only the captured items at your full kill speed, since
 there's no respawn data. Treat it as "worth a look", then measure it. `--leads N` sets how many
 to show; a `--levels` sweep shows the best lead per level.
+
+Leads are grouped by area:
+
+- **Same zone:** mobs in the same zone (or dungeon) are one lead. "Clearing all" kills whatever
+  comes up, weighted by spawn points when the mob's NPC page was captured (otherwise equally),
+  and adds up their drops. The headline is the better of that and farming the best mob alone.
+- **No zone known:** mobs whose zone isn't known (an item page lists them without one) group by
+  name family, e.g. *Twilight Peon* and *Twilight Grunt*. Check in game that they share a camp.
+- **Captured NPC pages:** a captured NPC page fills in the mob's level, zone and hostility.
+  With map positions (userscript v5) it becomes a real camp instead of a lead.
+
+Vanilla spawn points can alternate between up to five mobs (`id`..`id5` in the database).
+Each mob gets its share of the point's respawns.
 
 ## Crafting
 
@@ -318,48 +376,60 @@ automatically.
 
 Save your character once with `wowgold profile set ...`. Then use any of these:
 
-**In-game addon (recommended): records automatically.** Copy `addon/WowGoldLogger` into the
-Forever client's `Interface/AddOns` folder. If it's listed as out of date, tick "Load out of date
-AddOns": the Forever interface version wasn't known when this was written. Then just play.
+**In-game addon (recommended): records the sessions you start.** Copy `addon/WowGoldLogger` into
+the Forever client's `Interface/AddOns` folder. If it's listed as out of date, tick "Load out of date
+AddOns": the Forever interface version wasn't known when this was written.
 
-The addon records, per stretch of play in one zone (a *segment*):
-- what you looted and **where it came from**: which NPC, or which herb node, ore vein or fishing
-  bobber;
-- which gathering spell opened the loot (Herb Gathering, Mining, Skinning, Fishing);
-- what you killed, and the coins you looted.
+The **minimap button** (a gold coin; drag it around the minimap) opens a small session panel:
+- **Controls:** a timer, and Start, Pause and Stop buttons.
+- **Totals:** raw gold (coins looted), kills and kills per hour, and what the items are worth at a
+  vendor. If Auctionator is installed, it also shows their auction value.
+- **Gold per hour:** a rough figure from those totals.
+- **Lists:** the top crafting materials, and notable loot (green or better, and recipes).
 
-A segment ends when you change zone or after 10 minutes without loot or kills. Active time is the
-time between loot/kill events, each gap capped at 5 minutes, so AFK time doesn't count.
+When you're not recording, it shows the last session. Right-clicking the button starts, pauses or
+resumes. The same controls work as commands:
 
 ```
-/wgl status                 what the current segment has recorded
-/wgl list                   recently finished segments
-/wgl pause  /  /wgl resume  stop recording entirely (e.g. while questing)
-/wgl start herb_felwood     optional: label what you're doing, which skips auto-matching
-/wgl stop                   end the label
+/wgl                   open/close the panel
+/wgl start [note]      start recording, e.g. /wgl start gryphons hillsbrad
+/wgl pause | resume    breaks
+/wgl stop              finish, then /reload (WoW only writes addon data to disk then)
+/wgl status            what's being recorded, in chat
+/wgl minimap           hide/show the minimap button
 ```
 
-After a `/reload` or logout, import:
+Nothing is recorded outside a session. During one, the addon keeps a raw, timestamped event log:
+- **kills:** each mob you or your pet killed, with its spawn ID and your map position, plus mobs
+  that died near you to someone else;
+- **loot:** loot windows with each slot's source (mob, node or chest) and item, what reached your
+  bags, and coins;
+- **activity:** combat start and end, your casts (gathering, eating), and your position every 5
+  seconds while moving;
+- **progress and money:** XP, level-ups, skill-ups, deaths, quest turn-ins, and your money total;
+- **header:** character, class, level, faction and professions.
 
-```bash
-uv run wowgold session import "/path/to/World of Warcraft/<forever folder>/WTF/Account/<ACCOUNT>/SavedVariables/WowGoldLogger.lua"
-```
+The hourly collector imports new sessions on its own. It looks in the usual WoW folders on C:
+(through WSL), or in `WOWGOLD_ADDON_FILE` if you set it. *Import now* on the **Sessions** page, or
+`wowgold session import <file>`, does it on demand. The Sessions page shows each session:
+- gold per active hour at today's prices;
+- kills per hour, and your kill speed against the model;
+- loot per mob next to what the loot model expects;
+- other players' kills around you, and respawn times you observed.
 
-On import, each segment is split into activities (herbalism, mining, skinning, fishing, killing).
-Each activity is then matched to the methods for that activity in that zone, by how much of the loot
-is the method's items. A beast's own loot counts towards the skinning route when you skinned it.
+What feeds back into the Farms page:
+- **Kill speed, per class:** the median of "the model's time per kill ÷ your time between kills"
+  over kills less than 3 minutes apart. It's pooled over sessions and pulled towards the model
+  until there are a good number of kills (30 kill-gaps' worth).
+- **Respawn times:** the same mob killed again at the same spot (within ~1.5% of the map). With 3
+  or more re-kills, the lower quartile of the gaps replaces vanilla's respawn, or the assumed 6
+  minutes for Forever mobs.
+- **Not your loot:** drop rates stay Wowhead's and the vanilla database's.
+- **Excluding a session:** mark it *Don't use for calibration* on its page, e.g. one spent
+  questing or in a group.
 
-- **Applied automatically:** one clear activity (≥70% of events), and one method covering ≥50% of
-  the loot and clearly ahead of the next candidate.
-- **Review:** mixed segments (e.g. herbing while killing satyrs) are split by events per activity.
-  Check them with `wowgold segments show <#>` and apply with `segments accept <#>`.
-- **Unmatched:** no method fits. `wowgold segments draft <#>` prints a method definition built from
-  what you actually got, ready to paste into `data/methods/`. Then
-  `wowgold segments assign <#> <new id>` uses the segment as its first measurement.
-- `segments assign <#> <method> [--activity kill]` overrides by hand; `segments ignore <#>` excludes
-  a segment.
-
-Re-importing the same file is safe.
+Older addon data (v0.2 segments) can still be imported and matched to methods with
+`wowgold segments`.
 
 **Timer.** `wowgold session start herb_felwood`, then `pause`/`resume`, then
 `wowgold session stop -i Dreamfoil:14 -i "Golden Sansam:6" --coins 2g10s`.

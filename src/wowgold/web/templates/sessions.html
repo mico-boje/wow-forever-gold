@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Sessions · wowgold{% endblock %}
+{% block head %}
+<style>
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } }
+  .steps { padding-left: 20px; margin: 6px 0; }
+  .steps li { margin: 3px 0; }
+  .slow { color: var(--bad); } .fast { color: var(--ok); }
+  tr.hidden td { opacity: .5; }
+  code.path { word-break: break-all; }
+</style>
+{% endblock %}
+
+{% macro speed(f) -%}
+  {%- if f is none %}<span class="muted">—</span>
+  {%- else %}<span class="{{ 'slow' if f < 0.9 else 'fast' if f > 1.1 }}">×{{ "%.2f" | format(f) }}</span>{% endif -%}
+{%- endmacro %}
+
+{% block main %}
+<h1>Sessions</h1>
+<p class="muted">Farming sessions recorded in game by the WowGoldLogger addon: what you killed, looted and earned, and how that compares with what wowgold predicts. Your kill speed and the respawn times you saw feed back into the Farms page.</p>
+{% if imported %}<div class="note">Import: {{ imported }}</div>{% endif %}
+
+<div class="grid2">
+  <div class="panel">
+    <strong>Recording a session</strong>
+    <ol class="steps small">
+      <li>Copy <code>addon/WowGoldLogger</code> into your WoW client's <code>Interface/AddOns</code> folder (once).</li>
+      <li>In game: <code>/wgl start gryphons hillsbrad</code> (the note is optional). A small REC timer shows while it records; <code>/wgl pause</code> / <code>resume</code> for breaks.</li>
+      <li><code>/wgl stop</code>, then <code>/reload</code> (or log out): WoW only writes addon data to disk then.</li>
+      <li>The hourly collector imports it, or press <em>Import now</em>.</li>
+    </ol>
+    <div class="small">
+      {% if files %}Addon file{{ "s" if files | length > 1 }}: {% for f in files %}<br><code class="path">{{ f }}</code>{% endfor %}
+      {% elif configured %}<span class="bad">WOWGOLD_ADDON_FILE is set but doesn't exist:</span> <code class="path">{{ configured }}</code>
+      {% else %}<span class="muted">No addon file found yet. It appears after your first <code>/reload</code> with the addon installed. If WoW isn't on C:, set <code>WOWGOLD_ADDON_FILE</code> in <code>.env</code> to <code>…/WTF/Account/&lt;ACCOUNT&gt;/SavedVariables/WowGoldLogger.lua</code>.</span>{% endif %}
+    </div>
+    <form method="post" action="/sessions/import" style="margin-top:8px"><button type="submit">Import now</button></form>
+  </div>
+
+  <div class="panel">
+    <strong>What your sessions changed</strong>
+    {% set cal = view.calibration %}
+    {% if cal.kill_speed %}
+    <table class="small" style="margin-top:6px">
+      <thead><tr><th>Class</th><th class="num">Kill speed</th><th class="num">Based on</th></tr></thead>
+      {% for cls, k in cal.kill_speed.items() %}
+      <tr><td>{{ cls | capitalize }}</td><td class="num">{{ speed(k.factor) }}</td><td class="num muted">{{ k.gaps }} kills, {{ k.sessions }} session{{ "s" if k.sessions != 1 }}</td></tr>
+      {% endfor %}
+    </table>
+    <p class="small muted">×1.00 = the model's pace. Farms for that class use your measured speed (pulled towards the model until there are a good number of kills).</p>
+    {% else %}
+    <p class="small muted">No kill speed measured yet: it needs a session with a few kills less than 3 minutes apart.</p>
+    {% endif %}
+    {% if cal.respawns %}
+    <table class="small">
+      <thead><tr><th>Measured respawn</th><th class="num">Time</th><th class="num">Re-kills</th></tr></thead>
+      {% for npc, r in cal.respawns.items() | sort(attribute='1.pairs', reverse=True) %}
+      <tr><td><a href="https://www.wowhead.com/forever/npc={{ npc }}" target="_blank" rel="noopener">{{ view.names.get(npc, "NPC %d" % npc) }}</a></td><td class="num">{{ r.seconds | dur }}</td><td class="num muted">{{ r.pairs }}</td></tr>
+      {% endfor %}
+    </table>
+    <p class="small muted">From killing the same mob at the same spot again; camps with these mobs use these times instead of vanilla's.</p>
+    {% endif %}
+    <p class="small muted">Your loot isn't used for scoring: drop rates stay Wowhead's and vanilla's.</p>
+  </div>
+</div>
+
+<h2>Recorded</h2>
+{% if view.digests %}
+<div class="panel scroll" style="padding:0"><table>
+  <thead><tr><th>When</th><th>Character</th><th>Where</th><th class="num">Active</th><th class="num">Kills/h</th><th class="num">Gold/h</th><th class="num">Kill speed</th><th class="num">Others' kills</th></tr></thead>
+  {% for d in view.digests %}{% set r = d.rec %}
+  {% set others = d.mobs | sum(attribute='others') %}
+  <tr class="{{ 'hidden' if r.hidden }}">
+    <td><a href="/sessions/{{ r.id }}">{{ r.started.strftime("%a %d %b %H:%M") }}</a>
+      {% if r.stopped is none %} <span class="chip">recording</span>{% endif %}{% if r.hidden %} <span class="chip">hidden</span>{% endif %}
+      {% if r.note %}<br><span class="small muted">{{ r.note }}</span>{% endif %}</td>
+    <td>{{ r.char.get("name") or "?" }}<br><span class="small muted">{{ (r.cls or "?") | capitalize }} {{ r.level or "" }}</span></td>
+    <td class="small">{{ d.zones[:2] | map(attribute=0) | join(", ") or "?" }}</td>
+    <td class="num">{{ d.active_s | dur }}</td>
+    <td class="num">{{ "%.0f" | format(d.kills_per_hour) if d.kills_per_hour is not none else "—" }}</td>
+    <td class="num"><strong>{{ d.gold_per_hour | gold if d.gold_per_hour is not none else "—" }}</strong></td>
+    <td class="num">{{ speed(d.kill_speed) }}</td>
+    <td class="num">{{ others if others else "" }}</td>
+  </tr>
+  {% endfor %}
+</table></div>
+<p class="small muted">Gold/h values what you looted at today's prices on your auction house (after its cut; vendor price where that's more), plus coins, per active hour (breaks of more than 5 minutes without anything happening don't count). Kill speed: the model's time per kill over yours. Others' kills: mobs that died near you to someone else.</p>
+{% else %}
+<p class="muted">No sessions yet.</p>
+{% endif %}
+{% endblock %}

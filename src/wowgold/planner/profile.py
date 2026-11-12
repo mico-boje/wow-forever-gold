@@ -17,6 +17,8 @@ class CharacterProfile(BaseModel):
     professions: dict[str, int] = Field(default_factory=dict)
     gear: GearTier = GearTier.FRESH
     epic_mount: bool = False
+    # Your measured kill speed relative to the model (play.calibration); not saved.
+    kill_speed: float = Field(default=1.0, exclude=True)
 
     model_config = {"populate_by_name": True}
 

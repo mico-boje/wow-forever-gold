@@ -69,7 +69,7 @@
 
 {% macro rate_span(item_id, produced) -%}
   {%- if rate -%}{%- set r = rate(item_id) -%}{%- set days = r.days_to_sell(produced) -%}
-  <span class="rate{{ ' slow' if days and days > form.sell_days }}" title="{% if r.market is none %}No AH listings: valued at vendor price{% else %}{{ 'Sold per day on the AH (measured)' if r.measured else 'Estimated sales per day (from listings; measured once the collector has 12h of history)' }}; {{ '{:,}'.format(r.listed) }} listed{% if days %}; your session's {{ '%.0f' | format(produced) }} = {{ '%.1f' | format(days) }} days of sales{% endif %}{% endif %}">{{ r.label() }}</span>
+  <span class="rate{{ ' slow' if days and days > form.sell_days }}" title="{% if r.market is none %}No AH listings: valued at vendor price{% else %}{{ 'Sold per day on the AH (measured)' if r.measured else 'Estimated sales per day (from listings; measured once the collector has 12h of history)' }}; {{ '{:,}'.format(r.listed) }} listed{% if days %}; your session's {{ '%.0f' | format(produced) }} = {{ '%.1f' | format(days) }} days of sales{% endif %}{% endif %}">{{ r.label() }}</span>{% if r.trend_label() %} <span class="trend {{ r.trend_class }}" title="{{ r.trend_title() }}">{{ r.trend_label() }}</span>{% endif %}
   {%- endif -%}
 {%- endmacro %}
 
@@ -108,7 +108,7 @@
           <td class="num">{{ "%.0f" | format(ln.produced) }}</td>
           <td class="num">{{ rate_span(ln.item_id, ln.produced) }}</td>
           <td class="num small muted">{{ "{:,}".format(r.listed) if r and r.market is not none else "" }}</td>
-          <td class="num small">{{ r.market | gold if r and r.market is not none else "" }}</td>
+          <td class="num small">{{ r.market | gold if r and r.market is not none else "" }}{% if r and r.market is not none and r.sell_factor < 0.995 %}<br><span class="trend down" title="{{ r.trend_title() }}">→ {{ (r.market * r.sell_factor) | round | int | gold }}</span>{% endif %}</td>
           <td class="small muted">{% if ln.vendor_units >= 0.5 and ln.ah_units %}{{ "%.0f" | format(ln.ah_units) }} AH, {{ "%.0f" | format(ln.vendor_units) }} vendor{% elif ln.vendor_units >= 0.5 %}vendor{% else %}AH{% endif %}</td>
           {% else %}
           <td colspan="6">coins + vendor trash</td>
@@ -117,7 +117,7 @@
         </tr>
         {% endfor %}
       </table></div>
-      <p class="small muted">Sells = units sold per day on your auction house ("~" = estimated from listings). Orange: this session alone would take longer than {{ form.sell_days | round(1) }} days to sell; the excess is valued at vendor price.</p>
+      <p class="small muted">Sells = units sold per day on your auction house ("~" = estimated from listings). Orange: this session alone would take longer than {{ form.sell_days | round(1) }} days to sell; the excess is valued at vendor price. Arrows: price trend per day (hover for details); a falling item is valued at where its trend puts it when you sell (→), a rising one at today's price.</p>
       {% if c.craft_notes %}<p class="small"><strong>Craft before selling</strong> (+{{ c.craft_extra | gold }}/h):</p>
       <ul class="small">{% for n in c.craft_notes %}<li>{{ n }}</li>{% endfor %}</ul>{% endif %}
       {% if ev.flags %}<ul class="small muted">{% for fl in ev.flags %}<li>{{ fl }}</li>{% endfor %}</ul>{% endif %}
@@ -138,19 +138,25 @@
   <tbody>
   {% for lead in leads %}{% set src = lead.source %}
   <tr>
-    <td><strong>{{ src.source_name }}</strong><br><span class="small muted">
+    <td>{% if lead.members | length > 1 %}<strong>{{ lead.title }}</strong>
+      <details class="small"><summary class="muted">{{ lead.members | map(attribute='source.source_name') | list | join(", ") | truncate(60) }}</summary>
+        <ul style="margin:4px 0;padding-left:16px">{% for m in lead.members %}<li><a href="https://www.wowhead.com/forever/{{ m.source.source_type }}={{ m.source.source_id }}" target="_blank" rel="noopener">{{ m.source.source_name }}</a>
+          {%- if m.source.level %} · lvl {{ m.source.level[0] }}–{{ m.source.level[1] }}{% endif %}{% if m.source.elite %} · elite{% endif %}{% if m.spawns %} · {{ m.spawns }} on map{% endif %}
+          · <span class="muted">alone {{ m.gold_per_hour | gold }}/h</span></li>{% endfor %}</ul>
+      </details>
+      {%- else %}<strong><a href="https://www.wowhead.com/forever/{{ src.source_type }}={{ src.source_id }}" target="_blank" rel="noopener">{{ src.source_name }}</a></strong><br><span class="small muted">
       {{ {"drop": "kill", "skinning": "skin"}.get(lead.kind, lead.kind) }} · {{ src.source_type }} {{ src.source_id }}
-      {% if src.level %} · lvl {{ src.level[0] }}–{{ src.level[1] }}{% endif %}</span></td>
+      {% if src.level %} · lvl {{ src.level[0] }}–{{ src.level[1] }}{% endif %}</span>{% endif %}</td>
     <td>{{ lead.zones[:2] | join(", ") or "?" }}</td>
-    <td class="small">{% for i in lead.items[:3] %}{{ i.name }} {{ "%.1f" | format(i.chance * 100) }}%{% if i.samples %} <span class="muted">(n={{ i.samples }})</span>{% endif %} {{ rate_span(i.item_id, i.chance * lead.rate * form.hours) }}<br>{% endfor %}</td>
-    <td class="num"><strong>{{ lead.gold_per_hour | gold }}</strong>/h</td>
+    <td class="small">{% for i in lead.items[:4] %}{{ i.name }} {{ "%.1f" | format(i.chance * 100) }}%{% if i.samples %} <span class="muted">(n={{ i.samples }})</span>{% endif %}{% if lead.members | length > 1 %} <span class="muted">· {{ i.source_name }}</span>{% endif %} {{ rate_span(i.item_id, i.per_hour * form.hours) }}<br>{% endfor %}</td>
+    <td class="num"><strong>{{ lead.gold_per_hour | gold }}</strong>/h{% if lead.mix_per_hour is not none %}<br><span class="small muted" title="Killing everything in the group as it comes, weighted by spawn points where Wowhead's map was captured">clearing all: {{ lead.mix_per_hour | gold }}/h</span>{% endif %}</td>
     <td>{% for fl in lead.flags %}<span class="chip">{{ fl }}</span>{% endfor %}</td>
   </tr>
   {% endfor %}
   </tbody>
 </table>
 </div>
-<p class="small muted">No spawn data for these, so "if plentiful" assumes full kill speed and counts only the captured items. Check them in game; Wowhead chances with few samples are noisy.</p>
+<p class="small muted">No spawn data for these, so "if plentiful" assumes full kill speed and counts only the captured items. Mobs in the same zone are one lead: "clearing all" kills whatever comes up (weighted by spawn points when their NPC page is captured); the headline is the better of that and farming the best mob alone. Mobs with no known zone group by name: capture their NPC pages to get zones and map positions (which turns them into camps). Check them in game; Wowhead chances with few samples are noisy.</p>
 {% endmacro %}
 
 {% block main %}
@@ -248,6 +254,13 @@
       <p><a class="btn" href="/capture?{{ form.query() }}">Verify these farms on Wowhead</a>
         <span class="small muted">Capture the mobs' and nodes' Forever loot tables; verified farms are re-scored with them.</span></p>
       {% with r = res %}{% include "_house_note.html" %}{% endwith %}
+      {% set cal = res.calibration %}{% set ks = cal.kill_speed.get(res.profile.cls) if cal else none %}
+      {% if ks or (cal and cal.respawns) %}
+      <div class="note small">Using your <a href="/sessions">recorded sessions</a>:
+        {%- if ks %} kill speed ×{{ "%.2f" | format(ks.factor) }} for {{ res.profile.cls }}s ({{ ks.gaps }} kills){% endif %}
+        {%- if ks and cal.respawns %};{% endif %}
+        {%- if cal.respawns %} {{ cal.respawns | length }} measured respawn time{{ "s" if cal.respawns | length > 1 }}{% endif %}.</div>
+      {% endif %}
       <div class="note warn small">Hypotheses from vanilla 1.12 data: drop rates, spawns and respawns may differ in Forever, and kill and gather rates are rough guesses. Test them in game, then record sessions.
         {% if res.sales_coverage_h < 12 %}Demand is estimated from listings until the collector has {{ "%.0f" | format(12 - res.sales_coverage_h) }} more hours of history.{% endif %}</div>
 

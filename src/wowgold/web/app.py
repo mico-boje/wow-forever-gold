@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 import yaml
 from fastapi import FastAPI, Request
@@ -36,6 +36,7 @@ from ..discovery.service import VanillaCache, run_crafting, run_discover, run_ne
 from ..market.firstseen import new_arrivals
 from ..market.myhouse import find_listing, load_my_houses, set_my_house
 from ..market.query import find_items
+from ..market.trends import HORIZON_DAYS, Trend
 from ..methods.models import PROFESSIONS, GearTier
 from ..planner.engine import PlanOptions
 from ..planner.pricing import ah_cut, build_price_book
@@ -171,6 +172,17 @@ def ago(ts: str | None) -> str:
     return f"{mins // 1440} days ago"
 
 
+def duration(seconds: float | None) -> str:
+    """1 h 05 min, 12 min, 40 s."""
+    if seconds is None:
+        return "—"
+    secs = int(seconds)
+    if secs < 60:
+        return f"{secs} s"
+    mins = secs // 60
+    return f"{mins // 60} h {mins % 60:02d} min" if mins >= 60 else f"{mins} min"
+
+
 @dataclass(frozen=True)
 class SellRate:
     """How fast an item sells on the AH, for showing next to farm yields."""
@@ -179,6 +191,38 @@ class SellRate:
     measured: bool
     listed: int
     market: int | None
+    trend: Trend | None = None
+    sell_factor: float = 1.0
+
+    def trend_label(self) -> str:
+        return self.trend.label() if self.trend and self.market is not None else ""
+
+    def trend_title(self) -> str:
+        t = self.trend
+        if not t or self.market is None:
+            return ""
+        parts = []
+        if t.drift is not None and t.trust:
+            parts.append(f"trend {t.drift * 100:+.0f}% per day over {t.history_h:.0f}h")
+        if t.change_24h is not None:
+            parts.append(f"{t.change_24h * 100:+.0f}% vs a day ago")
+        if t.change_7d is not None:
+            parts.append(f"{t.change_7d * 100:+.0f}% vs a week ago")
+        if t.swing is not None and t.trust:
+            parts.append(f"swings ±{t.swing * 100:.0f}% around the trend")
+        if self.sell_factor < 0.995:
+            parts.append(
+                f"valued at {self.sell_factor * 100:.0f}% of today's price (where the trend "
+                f"puts it in {HORIZON_DAYS:g} days)"
+            )
+        return "; ".join(parts)
+
+    @property
+    def trend_class(self) -> str:
+        t = self.trend
+        if not t or self.market is None or t.drift is None or not t.trust:
+            return ""
+        return "down" if t.falling else "swing" if t.swings else "up" if t.drift > 0.01 else ""
 
     def label(self) -> str:
         if self.market is None:
@@ -199,7 +243,14 @@ class SellRate:
 def sell_rate(book, item_id: int) -> SellRate:
     p = book.get(item_id)
     per_day = p.sold_per_day if p.absorb_measured else p.absorb_per_day
-    return SellRate(per_day if p.market else None, p.absorb_measured, p.listed_qty, p.market)
+    return SellRate(
+        per_day if p.market else None,
+        p.absorb_measured,
+        p.listed_qty,
+        p.market,
+        p.trend,
+        p.sell_factor,
+    )
 
 
 # -- the farms form --------------------------------------------------------------------------
@@ -404,6 +455,7 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
     templates = Jinja2Templates(directory=TEMPLATES)
     templates.env.filters["gold"] = gold
     templates.env.filters["ago"] = ago
+    templates.env.filters["dur"] = duration
     cache = cache or VanillaCache(s.wowgold_data_dir)
     token = get_token(s.wowgold_data_dir)
 
@@ -765,6 +817,7 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
             list_pages=list_pages,
             done=captured(s.wowgold_data_dir),
             job=names_job.state(),
+            rate=(lambda item_id: sell_rate(res.book, item_id)) if res and res.book else None,
         )
 
     @app.post("/new/fetch-names")
@@ -857,6 +910,75 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
         return RedirectResponse(f"/houses?saved={house_id}", status_code=303)
 
     # -- status ------------------------------------------------------------------------------
+
+    # -- recorded sessions (WowGoldLogger addon) ---------------------------------------------
+
+    def _addon_files():
+        from ..play.recordings import find_files
+
+        return find_files(s.wowgold_addon_file)
+
+    @app.get("/sessions", response_class=HTMLResponse)
+    def sessions_page(request: Request) -> HTMLResponse:
+        from ..play.service import sessions_view
+
+        with connect() as conn:
+            view = sessions_view(conn, cache, s.wowgold_region, s.wowgold_houses)
+        return render(
+            request,
+            "sessions.html",
+            view=view,
+            files=_addon_files(),
+            configured=s.wowgold_addon_file,
+            imported=request.query_params.get("imported"),
+        )
+
+    @app.get("/sessions/{rid}", response_class=HTMLResponse)
+    def session_page(request: Request, rid: str) -> HTMLResponse:
+        from ..play.service import sessions_view
+
+        with connect() as conn:
+            view = sessions_view(conn, cache, s.wowgold_region, s.wowgold_houses, rid=rid)
+        if not view.digests:
+            return HTMLResponse("No such session.", status_code=404)
+        d = view.digests[0]
+        return render(
+            request,
+            "session.html",
+            d=d,
+            book=view.books.get(d.rec.faction or "horde"),
+            vanilla=view.vanilla,
+            speed=view.calibration.kill_speed.get(d.rec.cls or ""),
+        )
+
+    @app.post("/sessions/import")
+    def sessions_import(request: Request) -> Response:
+        from ..play.recordings import auto_import
+
+        if not same_origin(request):
+            return PlainTextResponse("cross-site request refused", status_code=403)
+        with connect() as conn:
+            res = auto_import(conn, s.wowgold_data_dir, s.wowgold_addon_file, force=True)
+        r = res.result
+        msg = (
+            f"{r.new} new, {r.updated} updated, {r.unchanged} unchanged"
+            if res.files
+            else "no addon file found"
+        )
+        if res.errors:
+            msg += "; " + "; ".join(res.errors)
+        return RedirectResponse(f"/sessions?imported={quote(msg)}", status_code=303)
+
+    @app.post("/sessions/{rid}/hide")
+    async def session_hide(request: Request, rid: str) -> Response:
+        from ..play.recordings import set_hidden
+
+        if not same_origin(request):
+            return PlainTextResponse("cross-site request refused", status_code=403)
+        hidden = (await request.form()).get("hidden") == "1"
+        with connect() as conn:
+            set_hidden(conn, rid, hidden)
+        return RedirectResponse(f"/sessions/{quote(rid)}", status_code=303)
 
     @app.get("/status", response_class=HTMLResponse)
     def status(request: Request) -> HTMLResponse:

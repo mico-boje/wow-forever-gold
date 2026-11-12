@@ -20,7 +20,7 @@ import math
 import re
 import sqlite3
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from ..methods.models import Confidence, Faction, GearTier, ItemQty, Kind, Method, Requirements
 from ..planner.engine import Evaluation, PlanOptions, _sell, eligibility, evaluate
@@ -88,6 +88,8 @@ class VanillaData:
     area_names: dict[int, str] = field(default_factory=dict)  # area/zone id -> name
     # Loot tables replaced wholesale by a captured Wowhead NPC/object page -> its sample size
     replaced: dict[tuple[str, int], int] = field(default_factory=dict)
+    # Respawn times measured in your recorded sessions (seconds), by creature entry
+    respawn: dict[int, float] = field(default_factory=dict)
 
     @classmethod
     def load(cls, conn: sqlite3.Connection) -> VanillaData:
@@ -312,13 +314,17 @@ def _method_from_rates(
 # -- mob camps -----------------------------------------------------------------------------------
 
 
-def kills_per_hour(c: v.Creature, player_level: int, cls: str | None = None) -> float:
+def kills_per_hour(
+    c: v.Creature, player_level: int, cls: str | None = None, speed: float = 1.0
+) -> float:
+    """Solo kills per hour of mob `c`. `speed` scales the model by your measured kill speed
+    (play.calibration)."""
     gap = player_level - c.level_max
     if gap >= 0:
         rate = KILLS_PER_HOUR_EVEN * min(1 + KILLS_PER_LEVEL_ABOVE * gap, MAX_KILL_SPEEDUP)
     else:
         rate = KILLS_PER_HOUR_EVEN * max(1 + KILLS_PER_LEVEL_BELOW * gap, 0.2)
-    rate *= CLASS_KILL_SPEED.get(cls or "", 1.0)
+    rate *= CLASS_KILL_SPEED.get(cls or "", 1.0) * speed
     if c.rank == v.RANK_ELITE:
         return rate * ELITE_FACTOR
     if cls == "mage" and gap >= MAGE_AOE_MIN_GAP:
@@ -365,13 +371,16 @@ def mob_camps(
             value += sum(q * unit_value(i, data, book) for i, q in pickpocket_loot(c, data).items())
         if value > 0:
             ev[c.entry] = value
-            rate[c.entry] = kills_per_hour(c, profile.level, profile.cls)
+            rate[c.entry] = kills_per_hour(c, profile.level, profile.cls, profile.kill_speed)
 
     # supply (respawns per hour) per cell per creature
     cells: dict[tuple[int, int, int], dict[int, float]] = defaultdict(lambda: defaultdict(float))
     for s in data.creature_spawns:
         if s.entry in ev:
-            cells[(s.map, int(s.x // CELL), int(s.y // CELL))][s.entry] += 3600 / s.respawn_s
+            respawn = data.respawn.get(s.entry, s.respawn_s)
+            cells[(s.map, int(s.x // CELL), int(s.y // CELL))][s.entry] += (
+                3600 / respawn * s.p_active
+            )
 
     def allocate(supply: dict[int, float]) -> tuple[float, dict[int, float]]:
         """Spend one hour killing the most valuable mobs first."""
@@ -440,7 +449,14 @@ def _camp_methods(data, profile, book, zone, map_id, x, y, mobs, kills) -> list[
             for item, q in pickpocket_loot(c, data).items():
                 per_hour[item] += n * q
 
-    respawns = sorted({int(s.respawn_s) for s in data.creature_spawns if s.entry in kills})
+    respawns = sorted(
+        {
+            int(data.respawn.get(s.entry, s.respawn_s))
+            for s in data.creature_spawns
+            if s.entry in kills
+        }
+    )
+    measured = [e for e in mobs if e in data.respawn]
     evidence = [
         f"{data.creatures[e].name} (lvl {data.creatures[e].level_min}-"
         f"{data.creatures[e].level_max}{', elite' if data.creatures[e].rank else ''}): "
@@ -454,7 +470,9 @@ def _camp_methods(data, profile, book, zone, map_id, x, y, mobs, kills) -> list[
             ]
     where = f"{zone}, around world ({x:.0f}, {y:.0f}) on {('Eastern Kingdoms', 'Kalimdor')[map_id]}"
     desc = (
-        f"Kill {names}. {where}. Respawn {respawns[0] // 60}-{respawns[-1] // 60} min. "
+        f"Kill {names}. {where}. Respawn {respawns[0] // 60}-{respawns[-1] // 60} min"
+        + (" (measured in your sessions)" if measured else "")
+        + ". "
         f"Kill rates assume a level {profile.level} {profile.cls}"
         + (" (pickpocketing first)" if any(can_pickpocket(c, profile) for c in creatures) else "")
         + "."
@@ -756,6 +774,7 @@ def parse_levels(spec: str, step: int = 5) -> list[int]:
 # -- leads: Forever-only sources without spawn data ----------------------------------------------
 
 LEAD_NODES_PER_HOUR = 40.0  # if the nodes are plentiful; we don't know their spawns
+NAME_FAMILY_MIN = 4  # "Twilight Peon" + "Twilight Grunt": same family when the zone is unknown
 
 
 @dataclass
@@ -765,17 +784,181 @@ class LeadItem:
     chance: float
     samples: int | None
     value_per_hour: float  # copper, demand-capped
+    per_hour: float = 0.0  # units per hour
+    source_name: str = ""  # which mob/node drops it (in a group)
+
+
+@dataclass
+class LeadMember:
+    """One mob or object in a lead, with what it's worth if you farm only it."""
+
+    source: ItemSource
+    kinds: list[str]
+    rate: float  # kills or loots per hour if it were the only target
+    value_per_kill: float  # copper, uncapped
+    gold_per_hour: float  # copper per hour farming only this, demand-capped
+    items: list[LeadItem]
+    flags: list[str]
+    spawns: int | None = None  # spawn points on Wowhead's map, if its NPC page was captured
 
 
 @dataclass
 class Lead:
-    source: ItemSource  # representative row (name, level, zones, ...)
+    source: ItemSource  # representative row (the best member)
     kind: str
     zones: list[str]
     rate: float  # kills or nodes per hour assumed
     items: list[LeadItem]
     gold_per_hour: float  # copper per hour from these items alone, if the source is plentiful
     flags: list[str] = field(default_factory=list)
+    members: list[LeadMember] = field(default_factory=list)
+    title: str = ""
+    grouped_by: str = ""  # zone | name | "" (single source)
+    mix_per_hour: float | None = None  # clearing everything in the group, if grouped
+
+    @property
+    def best(self) -> LeadMember | None:
+        return self.members[0] if self.members else None
+
+
+def _enrich(src: ItemSource, entities: dict | None) -> ItemSource:
+    """Fill a source's level, zones and hostility from its captured NPC/object page."""
+    ent = (entities or {}).get((src.source_type, src.source_id))
+    info = ent.info if ent else None
+    if info is None:
+        return src
+    return replace(
+        src,
+        level=src.level or info.level,
+        zones=src.zones or info.zones,
+        react=src.react or info.react,
+        elite=src.elite or info.elite,
+        boss=src.boss or info.boss,
+        source_name=src.source_name or info.name,
+    )
+
+
+def _member(
+    rows: list[ItemSource],
+    data: VanillaData,
+    profile: CharacterProfile,
+    book: PriceBook,
+    opts: PlanOptions,
+    elites: bool,
+) -> LeadMember | None:
+    """Score one mob/object from its captured drop rows; None if this character can't farm it."""
+    src = rows[0]
+    flags: list[str] = []
+    kinds = sorted({r.kind for r in rows})
+    if src.source_type == "npc":
+        if src.boss or src.friendly_to(profile.faction):
+            return None
+        if src.elite and not elites:
+            return None
+        lo, hi = src.level or (profile.level, profile.level)
+        if lo > profile.level + MAX_LEVELS_ABOVE:
+            return None
+        keep = []
+        for r in rows:
+            if r.kind == "pickpocket" and profile.cls != "rogue":
+                continue
+            if r.kind == "skinning":
+                need = skinning_skill_for(hi)
+                if profile.professions.get("skinning", 0) < need:
+                    continue
+                flags.append(f"skinning {need}")
+            keep.append(r)
+        rows = keep
+        mob = v.Creature(
+            0,
+            src.source_name,
+            lo,
+            hi,
+            v.RANK_ELITE if src.elite else v.RANK_NORMAL,
+            0,
+            0,
+            0,
+            0,
+            0,
+            frozenset(),
+        )
+        rate = kills_per_hour(mob, profile.level, profile.cls, profile.kill_speed)
+        if src.level is None:
+            flags.append("level unknown")
+        if src.elite:
+            flags.append("elite")
+    else:
+        prof = src.kind if src.kind in ("mining", "herbalism") else None
+        skill = max((r.skill or 0) for r in rows)
+        if prof and profile.professions.get(prof, 0) < skill:
+            return None
+        if prof:
+            flags.append(f"{prof} {skill}")
+        rate = LEAD_NODES_PER_HOUR
+    items, total, per_kill = [], 0.0, 0.0
+    for r in rows:
+        price = book.get(r.item_id)
+        vi = data.items.get(r.item_id)
+        produced = r.chance * rate * opts.hours
+        value = (
+            produced * unit_value(r.item_id, data, book)
+            if price.market is None
+            else _sell(produced, price, opts)[2]
+        ) / opts.hours
+        name = price.name or (vi.name if vi else r.item_name or f"item {r.item_id}")
+        items.append(
+            LeadItem(r.item_id, name, r.chance, r.samples, value, r.chance * rate, src.source_name)
+        )
+        total += value
+        per_kill += r.chance * unit_value(r.item_id, data, book)
+    if total <= 0:
+        return None
+    if any((i.samples or 0) < 30 for i in items):
+        flags.append("few samples")
+    items.sort(key=lambda i: -i.value_per_hour)
+    return LeadMember(src, kinds, rate, per_kill, total, items, list(dict.fromkeys(flags)))
+
+
+def _mix(
+    members: list[LeadMember], data: VanillaData, book: PriceBook, opts: PlanOptions
+) -> tuple[float, float, list[LeadItem]]:
+    """Clearing a group: kill whatever comes up, in proportion to how many there are (spawn
+    points when known, else equal). Returns (copper/h, kills/h, items)."""
+    known = [m.spawns for m in members if m.spawns]
+    default = sorted(known)[len(known) // 2] if known else 1
+    weights = [m.spawns or default for m in members]
+    hours_per_cycle = sum(w / m.rate for w, m in zip(weights, members, strict=True))
+    if hours_per_cycle <= 0:
+        return 0.0, 0.0, []
+    cycles = 1 / hours_per_cycle  # per hour
+    produced: dict[int, float] = defaultdict(float)
+    best_row: dict[int, LeadItem] = {}
+    for w, m in zip(weights, members, strict=True):
+        for it in m.items:
+            produced[it.item_id] += cycles * w * it.chance
+            if it.item_id not in best_row or it.chance > best_row[it.item_id].chance:
+                best_row[it.item_id] = it
+    items, total = [], 0.0
+    for item_id, per_hour in produced.items():
+        price = book.get(item_id)
+        amount = per_hour * opts.hours
+        value = (
+            amount * unit_value(item_id, data, book)
+            if price.market is None
+            else _sell(amount, price, opts)[2]
+        ) / opts.hours
+        row = best_row[item_id]
+        items.append(
+            LeadItem(item_id, row.name, row.chance, row.samples, value, per_hour, row.source_name)
+        )
+        total += value
+    items.sort(key=lambda i: -i.value_per_hour)
+    return total, cycles * sum(weights), items
+
+
+def _family(name: str) -> str | None:
+    word = (name or "").split(" ")[0]
+    return word if len(word) >= NAME_FAMILY_MIN and len(name.split(" ")) > 1 else None
 
 
 def find_leads(
@@ -786,80 +969,102 @@ def find_leads(
     opts: PlanOptions,
     *,
     elites: bool = False,
+    entities: dict | None = None,
+    zone_names: dict[int, str] | None = None,
 ) -> list[Lead]:
     """Rank sources we can't build a camp for: value of the captured items alone, assuming the
-    mobs/nodes are plentiful. A lead says where to look, not what it pays."""
-    groups: dict[tuple[str, int, str], list[ItemSource]] = defaultdict(list)
+    mobs/nodes are plentiful. A lead says where to look, not what it pays.
+
+    Mobs in the same zone become one lead ("clear the area"): their drops add up, at a kill
+    rate mixed from each mob's. Mobs with no known zone group by name family (Twilight Peon,
+    Twilight Grunt, ...). Objects (chests, nodes) stay single."""
+    by_source: dict[tuple[str, int], list[ItemSource]] = defaultdict(list)
     for src in unplaced:
         if src.chance and src.chance > 0:
-            groups[(src.source_type, src.source_id, src.kind)].append(src)
+            by_source[(src.source_type, src.source_id)].append(_enrich(src, entities))
+    # an item page and the NPC's own page can both list a drop: keep the bigger sample
+    for key, rows in by_source.items():
+        best: dict[tuple[str, int], ItemSource] = {}
+        for r in rows:
+            k = (r.kind, r.item_id)
+            if k not in best or (r.samples or 0) > (best[k].samples or 0):
+                best[k] = r
+        by_source[key] = list(best.values())
+
+    names = {**data.area_names, **(zone_names or {})}
+    members: list[LeadMember] = []
+    for (stype, sid), rows in by_source.items():
+        m = _member(rows, data, profile, book, opts, elites)
+        if m is None:
+            continue
+        ent = (entities or {}).get((stype, sid))
+        if ent is not None and ent.points:
+            m.spawns = len(ent.points)
+        members.append(m)
+
+    groups: dict[tuple, list[LeadMember]] = defaultdict(list)
+    zoneless_family: dict[str, int] = defaultdict(int)
+    for m in members:
+        src = m.source
+        if src.source_type == "npc" and not src.zones and (fam := _family(src.source_name)):
+            zoneless_family[fam] += 1
+    for m in members:
+        src = m.source
+        if src.source_type != "npc":
+            groups[("single", src.source_type, src.source_id)].append(m)
+        elif src.zones:
+            groups[("zone", src.zones[0])].append(m)
+        elif (fam := _family(src.source_name)) and zoneless_family[fam] > 1:
+            groups[("name", fam)].append(m)
+        else:
+            groups[("single", "npc", src.source_id)].append(m)
 
     leads = []
-    for (stype, _, kind), rows in groups.items():
-        src = rows[0]
-        flags = []
-        if stype == "npc":
-            if src.boss or src.friendly_to(profile.faction):
-                continue
-            if src.elite and not elites:
-                continue
-            if kind == "pickpocket" and profile.cls != "rogue":
-                continue
-            lo, hi = src.level or (profile.level, profile.level)
-            if lo > profile.level + MAX_LEVELS_ABOVE:
-                continue
-            if kind == "skinning":
-                need = skinning_skill_for(hi)
-                if profile.professions.get("skinning", 0) < need:
-                    continue
-                flags.append(f"skinning {need}")
-            mob = v.Creature(
-                0,
-                src.source_name,
-                lo,
-                hi,
-                v.RANK_ELITE if src.elite else v.RANK_NORMAL,
-                0,
-                0,
-                0,
-                0,
-                0,
-                frozenset(),
-            )
-            rate = kills_per_hour(mob, profile.level, profile.cls)
-            if src.level is None:
-                flags.append("level unknown")
-            if src.elite:
-                flags.append("elite")
-        else:
-            prof = kind if kind in ("mining", "herbalism") else None
-            skill = max((r.skill or 0) for r in rows)
-            if prof and profile.professions.get(prof, 0) < skill:
-                continue
-            if prof:
-                flags.append(f"{prof} {skill}")
-            rate = LEAD_NODES_PER_HOUR
-        items = []
-        total = 0.0
-        for r in rows:
-            price = book.get(r.item_id)
-            vi = data.items.get(r.item_id)
-            produced = r.chance * rate * opts.hours
-            value = (
-                produced * unit_value(r.item_id, data, book)
-                if price.market is None
-                else _sell(produced, price, opts)[2]
-            ) / opts.hours
-            name = price.name or (vi.name if vi else r.item_name or f"item {r.item_id}")
-            items.append(LeadItem(r.item_id, name, r.chance, r.samples, value))
-            total += value
-        if total <= 0:
-            continue
-        if any((i.samples or 0) < 30 for i in items):
+    for key, ms in groups.items():
+        ms.sort(key=lambda m: -m.gold_per_hour)
+        top = ms[0]
+        zones = [names.get(z, f"zone {z}") for z in top.source.zones]
+        flags = list(dict.fromkeys(f for m in ms for f in m.flags if f != "few samples"))
+        if any("few samples" in m.flags for m in ms):
             flags.append("few samples")
-        zones = [data.area_names.get(z, f"zone {z}") for z in src.zones]
-        items.sort(key=lambda i: -i.value_per_hour)
-        leads.append(Lead(src, kind, zones, rate, items, total, flags))
+        if len(ms) == 1:
+            leads.append(
+                Lead(
+                    top.source,
+                    top.kinds[0] if len(top.kinds) == 1 else "drop",
+                    zones,
+                    top.rate,
+                    top.items,
+                    top.gold_per_hour,
+                    flags,
+                    ms,
+                    top.source.source_name,
+                )
+            )
+            continue
+        mix, kills, items = _mix(ms, data, book, opts)
+        if key[0] == "zone":
+            title, grouped_by = f"{len(ms)} mobs in {zones[0] if zones else '?'}", "zone"
+        else:
+            title, grouped_by = f"{key[1]} mobs ({len(ms)}, zone unknown)", "name"
+            flags.insert(0, "grouped by name: check they share a camp")
+        if top.gold_per_hour > mix:
+            flags.append(f"{top.source.source_name} alone: more than clearing everything")
+        leads.append(
+            Lead(
+                top.source,
+                "drop",
+                zones,
+                kills,
+                items,
+                max(mix, top.gold_per_hour),
+                flags,
+                ms,
+                title,
+                grouped_by,
+                mix,
+            )
+        )
     leads.sort(key=lambda lead: -lead.gold_per_hour)
     return leads
 
@@ -942,8 +1147,10 @@ def forever_camps(
             0,
             frozenset(),
         )
+        respawn = data.respawn.get(npc_id, FOREVER_RESPAWN_S)
         kills = min(
-            kills_per_hour(mob, profile.level, profile.cls), spawns * 3600 / FOREVER_RESPAWN_S
+            kills_per_hour(mob, profile.level, profile.cls, profile.kill_speed),
+            spawns * 3600 / respawn,
         )
         skinning_need = skinning_skill_for(hi)
         can_skin = profile.professions.get("skinning", 0) >= skinning_need
@@ -983,11 +1190,19 @@ def forever_camps(
             book=book,
             description=(
                 f"Kill {name} (new in Forever). {zone}, around map ({x:.0f}, {y:.0f}): "
-                f"{spawns} spawns close together, {total} on Wowhead's map. Respawn assumed "
-                f"{FOREVER_RESPAWN_S // 60} min; coins not included. Kill rates assume a level "
+                f"{spawns} spawns close together, {total} on Wowhead's map. Respawn "
+                + (
+                    f"{respawn / 60:.1f} min (measured in your sessions)"
+                    if npc_id in data.respawn
+                    else f"assumed {FOREVER_RESPAWN_S // 60} min"
+                )
+                + "; coins not included."
+                f" Kill rates assume a level "
                 f"{profile.level} {profile.cls}."
             ),
-            risk=["competition", "assumed_respawn"] + (["elite_mobs"] if elite else []),
+            risk=["competition"]
+            + ([] if npc_id in data.respawn else ["assumed_respawn"])
+            + (["elite_mobs"] if elite else []),
         )
         evidence = [
             f"{name} (lvl {lo}-{hi}{', elite' if elite else ''}): {kills:.0f} kills/h",
