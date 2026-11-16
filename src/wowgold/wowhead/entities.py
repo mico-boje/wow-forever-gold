@@ -38,6 +38,7 @@ class MapPoint:
     zone_name: str | None
     x: float  # percent of the zone map, 0-100
     y: float
+    ui_map_id: int | None = None  # the game's map ID for that zone map (C_Map)
 
 
 @dataclass
@@ -88,10 +89,17 @@ def _walk(obj, zone: int | None, out: list[MapPoint]) -> None:
         coords = obj.get("coords")
         if isinstance(coords, list):
             name = obj.get("uiMapName") or obj.get("zoneName") or obj.get("name")
+            ui_map = _num(obj.get("uiMapId"))
             for c in coords:
                 if isinstance(c, list) and len(c) >= 2 and _num(c[0]) is not None:
                     out.append(
-                        MapPoint(zone, str(name) if name else None, float(c[0]), float(c[1]))
+                        MapPoint(
+                            zone,
+                            str(name) if name else None,
+                            float(c[0]),
+                            float(c[1]),
+                            int(ui_map) if ui_map else None,
+                        )
                     )
         for k, v in obj.items():
             if k == "coords":

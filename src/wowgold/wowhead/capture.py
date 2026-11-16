@@ -26,9 +26,9 @@ WOWHEAD = "https://www.wowhead.com/forever"
 MAX_BODY = 64 * 1024 * 1024  # profession recipe lists are big
 # Bump when the userscript changes; captures record the version that sent them, so the app
 # can tell you when the installed one is outdated.
-USERSCRIPT_VERSION = 5
+USERSCRIPT_VERSION = 6
 HISTORY_KEEP = 3  # previous versions kept per page, to show what changed on a recapture
-PAGE_RE = re.compile(r"wowhead\.com/forever/(item|npc|object)=(\d+)")
+PAGE_RE = re.compile(r"wowhead\.com/forever/(item|npc|object|zone)=(\d+)")
 # Spell list pages, e.g. /forever/spells/professions/alchemy: every recipe of a profession.
 SPELLS_RE = re.compile(r"wowhead\.com/forever/spells/([a-z0-9/-]+)")
 # Item list pages, e.g. /forever/items/trade-goods or /forever/items?filter=...: every item of
@@ -255,6 +255,7 @@ USERSCRIPT = r"""// ==UserScript==
 // @match        https://www.wowhead.com/forever/item=*
 // @match        https://www.wowhead.com/forever/npc=*
 // @match        https://www.wowhead.com/forever/object=*
+// @match        https://www.wowhead.com/forever/zone=*
 // @match        https://www.wowhead.com/forever/spells/*
 // @match        https://www.wowhead.com/forever/items*
 // @updateURL    http://127.0.0.1:__PORT__/wowgold-capture.user.js
@@ -303,7 +304,8 @@ USERSCRIPT = r"""// ==UserScript==
   function raw() {
     return Array.from(document.scripts)
       .map((s) => s.textContent || "")
-      .filter((t) => t.includes("Listview") || t.includes("g_mapperData") || t.includes("g_npcs"))
+      .filter((t) => t.includes("Listview") || t.includes("g_mapperData") || t.includes("g_npcs") ||
+        t.includes("g_zones"))
       .map((t) => t.slice(0, 2000000));
   }
 

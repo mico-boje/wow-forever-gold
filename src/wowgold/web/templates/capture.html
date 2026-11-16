@@ -103,6 +103,36 @@
 </div>
 {% endif %}
 
+{% if zones %}
+<h2>Forever zones</h2>
+<p class="muted small">Zones that aren't in the vanilla database, found in your captures. Capture a zone's page first: it lists the zone's mobs, herbs, ore veins and chests, which then show up here. Their own pages add drop rates and map positions, and turn them into camps and gathering loops on the Farms page. For a zone not listed yet, open its Wowhead page (<code>wowhead.com/forever/zone=…</code>) with the userscript running (version 6+).</p>
+{% for z in zones %}
+<details class="panel zone" style="padding:0;margin-bottom:8px" {{ "open" if loop.first }}>
+  <summary style="padding:8px 12px;cursor:pointer"><strong>{{ z.name }}</strong>
+    {% if z.level %}<span class="muted small"> · mobs lvl {{ z.level[0] }}–{{ z.level[1] }}</span>{% endif %}
+    <span class="muted small"> · <span class="zone-count">{{ z.rows | selectattr('key', 'in', done) | list | length }}/{{ z.rows | length }}</span> pages captured{% if not z.captured %} · zone page not captured yet{% endif %}</span></summary>
+  <div class="bar" style="padding:0 12px 8px">
+    <button class="primary open-zone" type="button">Open next 10 in new tabs</button>
+    <span class="small muted">herbs, ore and chests first, then mobs nearest your level</span>
+  </div>
+  <p class="note warn small zone-hint" style="margin:0 12px 8px" hidden></p>
+  <div class="scroll"><table>
+    <tbody>
+    {% for r in z.rows %}
+    <tr data-key="{{ r.key }}">
+      <td class="st"></td>
+      <td><a href="{{ r.url }}" target="_blank" rel="noopener">{{ r.name }}</a></td>
+      <td class="small muted">{{ r.note }}</td>
+      <td><button class="skip" type="button">skip</button></td>
+    </tr>
+    {% endfor %}
+    {% if z.hidden %}<tr><td></td><td colspan="3" class="small muted">+{{ z.hidden }} more mobs further from your level</td></tr>{% endif %}
+    </tbody>
+  </table></div>
+</details>
+{% endfor %}
+{% endif %}
+
 {% if recipe_pages is defined and recipe_pages %}
 <h2>Recipes</h2>
 <p class="muted small">Each profession's recipe list on Wowhead holds every recipe: reagents, what it makes, skill and trainer fee. Capture these once (and again after patches) and the <a href="/crafting">Crafting</a> tab knows all Forever recipes. These pages need userscript version 2: <a href="/wowgold-capture.user.js">reinstall it</a> if no badge appears on them.</p>
@@ -173,15 +203,15 @@ try { skipped = new Set(JSON.parse(localStorage.getItem("wowgold-skip") || "[]")
 function saveSkips() {
   try { localStorage.setItem("wowgold-skip", JSON.stringify([...skipped])); } catch (e) {}
 }
-function rows() { return [...document.querySelectorAll("tr[data-key]")]; }
+function rows(scope) { return [...(scope || document).querySelectorAll("tr[data-key]")]; }
 // a row is done when its page is captured (for outdated pages: captured again since)
 function isDone(tr) {
   const at = done[tr.dataset.key];
   return at !== undefined && (!tr.dataset.at || at > tr.dataset.at);
 }
-function pending() {
-  return rows().filter((tr) => !isDone(tr) && !skipped.has(tr.dataset.key)
-                               && !opened.has(tr.dataset.key));
+function pending(scope) {
+  return rows(scope).filter((tr) => !isDone(tr) && !skipped.has(tr.dataset.key)
+                                    && !opened.has(tr.dataset.key));
 }
 function render() {
   let n = 0;
@@ -198,17 +228,27 @@ function render() {
   btn.disabled = left === 0;
   btn.textContent = left === 0 ? "Nothing left to open"
     : "Open next " + Math.min(BATCH, left) + " in new tabs";
+  for (const zone of document.querySelectorAll("details.zone")) {
+    const all = rows(zone), zleft = pending(zone).length, zbtn = zone.querySelector(".open-zone");
+    zone.querySelector(".zone-count").textContent =
+      all.filter(isDone).length + "/" + all.length;
+    zbtn.disabled = zleft === 0;
+    zbtn.textContent = zleft === 0 ? "Nothing left to open"
+      : "Open next " + Math.min(BATCH, zleft) + " in new tabs";
+  }
 }
-document.getElementById("open").addEventListener("click", () => {
-  const hint = document.getElementById("hint");
+// open the next BATCH pending pages in `scope` (the whole page, or one zone)
+function openBatch(scope, hint) {
   hint.textContent = "";
-  pending().slice(0, BATCH).forEach((tr, i) => {
+  hint.hidden = true;
+  pending(scope).slice(0, BATCH).forEach((tr, i) => {
     setTimeout(() => {
       const win = window.open(tr.querySelector("a").href, "_blank");
       if (!win) {  // blocked: browsers allow one pop-up per click unless the site is allowed
         hint.textContent = "Only the first tab opened: your browser blocks a page from opening " +
           "several tabs at once. Allow pop-ups for 127.0.0.1 (the blocked pop-up icon at the " +
           "right of the address bar → Always allow), then click again.";
+        hint.hidden = false;
         hint.scrollIntoView({ block: "nearest", behavior: "smooth" });
         return;
       }
@@ -217,7 +257,13 @@ document.getElementById("open").addEventListener("click", () => {
       render();
     }, i * GAP_MS);
   });
-});
+}
+document.getElementById("open").addEventListener("click", () =>
+  openBatch(document, document.getElementById("hint")));
+for (const zone of document.querySelectorAll("details.zone")) {
+  zone.querySelector(".open-zone").addEventListener("click", () =>
+    openBatch(zone, zone.querySelector(".zone-hint")));
+}
 document.addEventListener("click", (e) => {
   if (!e.target.classList.contains("skip")) return;
   const key = e.target.closest("tr").dataset.key;

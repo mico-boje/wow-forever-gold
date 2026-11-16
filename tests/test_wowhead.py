@@ -10,7 +10,12 @@ from wowgold.wowhead.capture import (
     save_capture,
     userscript,
 )
-from wowgold.wowhead.sources import load_sources, parse_raw_listviews, sources_from_capture
+from wowgold.wowhead.sources import (
+    cautious_rate,
+    load_sources,
+    parse_raw_listviews,
+    sources_from_capture,
+)
 
 FEL_CRYSTAL = 248819
 
@@ -56,7 +61,10 @@ def test_listviews_become_sources():
     assert by[("mining", 175404)].source_type == "object"
     # skinned-from only exists in the raw script; dropped-by from raw is ignored because the
     # structured listview already had it
-    assert by[("skinning", 6115)].chance == pytest.approx(0.25)
+    skin = by[("skinning", 6115)]
+    # 3 in 12 kills: Wowhead's 25% is kept for display, valued at the cautious lower bound
+    assert skin.raw_chance == pytest.approx(0.25) and skin.cautious
+    assert skin.chance == pytest.approx(cautious_rate(3, 12)) and skin.chance < 0.15
     assert ("drop", 1) not in by
     assert all(s.kind != "comment" for s in sources)
 

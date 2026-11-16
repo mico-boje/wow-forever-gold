@@ -1,8 +1,11 @@
 ## Interface: 11507, 16001
 ## Title: WowGold Logger
 ## Notes: Records farming sessions (kills, loot, combat, position) for the wowgold planner, only while you're recording. Minimap button: session panel.
-## Version: 3.1.0
+## Version: 3.3.0
 ## SavedVariables: WowGoldLoggerDB
+## OptionalDeps: RXPGuides
 
 WowGoldLogger.lua
 WowGoldLoggerUI.lua
+Routes.lua
+WowGoldLoggerRoutes.lua

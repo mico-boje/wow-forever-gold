@@ -85,7 +85,7 @@ Install it with `crontab -e`. On WSL, cron only runs while the WSL VM is up.
 
 Blizzard's API only serves the auction house as it is right now. An hour nobody fetched is gone,
 and you can't backfill it later. [.github/workflows/collect.yml](.github/workflows/collect.yml)
-fetches every house at :40 each hour on GitHub's servers. It uploads the raw snapshots as a workflow
+fetches every house once an hour on GitHub's servers. It uploads the raw snapshots as a workflow
 artifact, about 7 MB per hour, kept 30 days. That's free for public repositories, and the artifacts
 are public too, which is fine for auction data.
 
@@ -99,6 +99,10 @@ The local collector then runs `wowgold remote sync` instead of fetching. It down
 artifacts it hasn't seen (using `gh`'s login, or `WOWGOLD_GITHUB_TOKEN`), adds their snapshots
 oldest first, and ingests them. Hours collected while your machine was off fill in, as long as you
 sync within 30 days.
+
+GitHub delays and drops scheduled runs: an hourly schedule ran only about 4 times a day. So
+each run chains the next. It snapshots, waits out the hour, then starts the next run itself.
+The schedule is only a watchdog that restarts the chain if it stops.
 
 Safety nets:
 - **Falling back to direct fetches:** if GitHub can't be reached, or no GitHub snapshot has arrived
@@ -131,6 +135,10 @@ To confirm: list any cheap item in game at an unusual price (e.g. 1 Linen Cloth 
 - **Not modelled:** deposits (refunded on a sale, lost when an auction expires or is
   cancelled), and cancelled auctions count as sales in the sell-rate estimate, so sell rates of
   heavily undercut items run somewhat high.
+- **Thin markets:** some prices rest on fewer than 3 auctions and under 10 units, with no sale seen
+  in a week. A rare drop listed once at a troll price is a typical case. Those items are valued at
+  vendor price until a sale proves the AH price; the farm notes say so, and the Sells column shows
+  "no sales".
 - **Factions don't share listings:** Alliance and Horde houses are separate markets (checked:
   no auction ID appears on both). Blackwater houses are the neutral ones.
 
@@ -203,6 +211,11 @@ AH prices:
   first, limited by your kill speed (40/h at even level, faster when you out-level them) and
   by respawn times. The best squares become candidates, with a skinning variant when the mobs
   are skinnable.
+- **Gathering in camps.** With herbalism or mining, the herb and ore nodes inside a camp's
+  square share its hour with the kills. Each pickup takes 21 seconds: 6 to gather and 15 to
+  detour on foot. Pickups are limited by the nodes' respawns, and the most valuable target per
+  minute goes first. When that beats the plain camp, the camp shows as "+ herbalism" (or
+  mining), alongside skinning.
 - **Gathering loops.** Per zone and profession, node pools tell how many herbs/veins are up at
   once. Their spacing gives travel time per node, capped by each node type's respawn rate.
 
@@ -283,6 +296,31 @@ Leads are grouped by area:
 Vanilla spawn points can alternate between up to five mobs (`id`..`id5` in the database).
 Each mob gets its share of the point's respawns.
 
+## Resets
+
+The **Resets** tab finds items worth buying out and relisting. Each one is worked out from
+four things:
+- **Normal price:** the lower of the item's median price over the past week and over the last
+  day. A price that fell is relisted at what it fetches now. It's also lowered further when the
+  price trend is falling, and capped by an unlimited vendor offer. Items falling more than 15%
+  a day are skipped.
+- **Ladder:** every listing in the latest full snapshot, cheapest first. Gear with random
+  suffixes is left out.
+- **Sales and restocking:** both measured over the last 3 days, from snapshots at most 3 hours
+  apart. An item needs at least 3 sales seen. New listings from other sellers take a share of
+  the demand: you're assumed to get *sold / (sold + newly listed)* of it.
+- **The plan:** for each depth of buy-out, you relist everything just under the next listing you
+  didn't buy (or at the normal price, if lower). Only listings at least 15% under that are
+  bought, and a price level is bought whole (a part left behind would undercut you). It counts
+  what sells within the chosen number of days, after the cut, and values the rest at 70% of
+  what it cost. The depth with the best expected profit wins.
+
+Your gold comes from the WowGold addon (it records your money at the start and end of a
+session), or type an amount. The tab spends at most the share you pick. The **plan** chips mark
+the resets that fit together, best return on gold first. Each reset expands to the listing
+ladder, the sales and restock numbers, and its risks: falling or swinging price, slow sales,
+sellers restocking faster than it sells, and short history. Deposits aren't counted.
+
 ## Crafting
 
 **Getting every Forever recipe.** The Capture page has a *Recipes* checklist: Wowhead's
@@ -353,6 +391,45 @@ spawns on the zone map, kill speed for your class and level, the drop rates capt
 and an assumed 6-minute respawn (Wowhead doesn't publish respawn times; coins aren't included
 either). These camps rank alongside the vanilla ones on the Farms page.
 
+### Farming routes in game (RXPGuides)
+
+Every camp and gathering loop on the Farms page has a **Send route to game** button:
+1. wowgold orders the farm's spawn points into a short loop: nearest neighbour, then 2-opt. Spawns
+   closer than 30 yards count as one stop, and a route has at most 60 stops.
+2. It writes the routes you've sent into `Routes.lua` in the installed WowGoldLogger addon folder.
+   It finds the folder on C: through WSL, or uses `WOWGOLD_ADDON_DIR`.
+3. After `/reload`, the addon registers each route with **RXPGuides** as a guide under
+   **WowGold farms**: one `.loop` step that draws the route on the map and guides you around it
+   with RXP's arrow.
+
+Coordinates:
+- **Forever-zone routes** use Wowhead's map positions as they are.
+- **Vanilla routes** come in world coordinates, and the addon places them on the zone map with
+  the game's own map API.
+
+The Farms page lists the routes you've sent, with remove buttons; `/wgl routes` lists them in
+game.
+
+### Zones that are new in Forever
+
+The vanilla database doesn't know Forever's new zones. Capture a zone's Wowhead page
+(`wowhead.com/forever/zone=16591` for Riverglades; userscript **v6**) and wowgold reads:
+- the zone's name;
+- its mobs, with levels, hostility, elite and boss;
+- its objects: herbs, ore veins and chests. Herbs and veins are recognised by Wowhead's object
+  type, or by matching the vanilla node names.
+
+The **Capture** page lists every Forever zone your captures mention. Under each zone, it shows the
+zone page first, then that zone's hostile mobs and nodes to capture next. Those pages become:
+- **Camps:** the mob's NPC page, as above.
+- **Gathering loops:** a herb or ore node's page gives its spawn points in the zone. Its loot
+  comes from vanilla if the node exists there, otherwise from the captured drop rates. Forever
+  doesn't publish node respawns or zone sizes, so three things are assumed and noted on each
+  loop: vanilla's typical respawn, vanilla's typical share of spawn points up at once, and a
+  3,500-yard-wide zone.
+- **Leads:** mobs whose own page isn't captured yet still take their level and zone from the
+  zone page.
+
 ### Keeping captures fresh
 
 Wowhead's samples grow and patches change drops, so the Capture page tracks age:
@@ -397,11 +474,15 @@ resumes. The same controls work as commands:
 /wgl stop              finish, then /reload (WoW only writes addon data to disk then)
 /wgl status            what's being recorded, in chat
 /wgl minimap           hide/show the minimap button
+/wgl routes            farm routes sent from wowgold, and whether RXPGuides took them
 ```
 
 Nothing is recorded outside a session. During one, the addon keeps a raw, timestamped event log:
-- **kills:** each mob you or your pet killed, with its spawn ID and your map position, plus mobs
-  that died near you to someone else;
+- **kills:** each mob you killed, with its spawn ID and your map position, plus mobs that died
+  near you to someone else. Forever's client (Midnight engine) doesn't let addons read the
+  combat log, so a kill is recorded from whichever comes first: looting the corpse, or your
+  target or a nameplate dying while tapped by you. A mob tapped by someone else counts as
+  theirs. Values the game hides during combat are skipped. Older clients use the combat log.
 - **loot:** loot windows with each slot's source (mob, node or chest) and item, what reached your
   bags, and coins;
 - **activity:** combat start and end, your casts (gathering, eating), and your position every 5

@@ -21,6 +21,25 @@ def collection_start(conn: sqlite3.Connection, region: str) -> datetime | None:
 
 
 def first_seen(conn: sqlite3.Connection, region: str) -> dict[int, str]:
+    """item -> earliest time it was listed. Ingest keeps `item_first_seen` up to date; it's
+    filled from the price history the first time (or if it's empty)."""
+    if (
+        conn.execute("SELECT 1 FROM item_first_seen WHERE region = ? LIMIT 1", (region,)).fetchone()
+        is None
+    ):
+        rows = _first_seen_from_history(conn, region)
+        conn.executemany(
+            "INSERT OR REPLACE INTO item_first_seen VALUES (?, ?, ?)",
+            [(region, i, ts) for i, ts in rows.items()],
+        )
+        conn.commit()
+        return rows
+    return dict(
+        conn.execute("SELECT item_id, first_ts FROM item_first_seen WHERE region = ?", (region,))
+    )
+
+
+def _first_seen_from_history(conn: sqlite3.Connection, region: str) -> dict[int, str]:
     """item -> earliest time it was listed (hourly stats, or daily rollups for older data)."""
     out: dict[int, str] = {}
     for item_id, ts in conn.execute(

@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 
 from ..discovery.vanilla import VItem
-from ..planner.pricing import PriceBook, trend_flags
+from ..planner.pricing import PriceBook, thin_note, trend_flags
 from .recipes import Recipe
 
 # Upper bound on crafts per day when nothing else limits it (vendor-sold output, vendor mats):
@@ -156,9 +156,9 @@ def sell_unit(item_id: int, book: PriceBook, ctx: CraftContext) -> tuple[float, 
     """(net copper per unit, sold on the AH?)."""
     price = book.get(item_id)
     vendor = price.vendor_sell or (ctx.items[item_id].sell_price if item_id in ctx.items else 0)
-    if vendor_only(ctx.items.get(item_id)) or not price.market:
+    net = price.ah_net  # trend-adjusted; None when not listed or a thin market
+    if vendor_only(ctx.items.get(item_id)) or net is None:
         return float(vendor), False
-    net = price.ah_net  # sells at the trend-adjusted price
     return (net, True) if net > vendor else (float(vendor), False)
 
 
@@ -209,6 +209,8 @@ def evaluate_recipe(
         flags.append(
             "output sells to vendors only"
             if out.market is None
+            else thin_note(out)
+            if out.thin
             else "output is worth more at a vendor"
         )
     if out.market is not None and not out.absorb_measured:

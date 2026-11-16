@@ -8,6 +8,7 @@ blocks are parsed instead. Drop chance is `count / outof` (Wowhead's own loot st
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,12 @@ class ItemSource:
     skill: int | None = None  # gathering skill needed (gathered/mined-from objects)
     item_name: str = ""  # from the captured page's title
     from_page: bool = False  # from the source's own NPC/object page (its full loot table)
+    # Wowhead's own figure when `chance` was lowered because it rests on few kills
+    raw_chance: float | None = None
+
+    @property
+    def cautious(self) -> bool:
+        return self.raw_chance is not None and self.raw_chance > (self.chance or 0)
 
     def friendly_to(self, faction: str) -> bool:
         if not self.react:
@@ -68,6 +75,35 @@ def _num(v) -> float | None:
         return None
 
 
+# Rates from fewer kills than this are valued at a cautious lower estimate: the lower bound of
+# an 80% confidence interval (one-sided 90%). 16 drops in 24 kills (67%) counts as ~54%;
+# 20 in 33 (61%) as ~49%; a rate from thousands of kills is left alone.
+SMALL_SAMPLE = 100
+CAUTION_Z = 1.2816
+
+
+def cautious_rate(count: float, outof: float) -> float:
+    """Wilson score lower bound of count/outof for small samples, else count/outof."""
+    if outof <= 0:
+        return 0.0
+    p = min(1.0, max(0.0, count / outof))
+    if outof >= SMALL_SAMPLE:
+        return p
+    z2 = CAUTION_Z**2
+    centre = p + z2 / (2 * outof)
+    margin = CAUTION_Z * math.sqrt(p * (1 - p) / outof + z2 / (4 * outof**2))
+    return max(0.0, (centre - margin) / (1 + z2 / outof))
+
+
+def _rates(count: float, outof: float, stack: float = 1.0) -> tuple[float, float | None]:
+    """(chance to use, Wowhead's figure if that was lowered)."""
+    raw = max(0.0, count) / outof
+    safe = cautious_rate(count, outof)
+    if safe < min(1.0, raw) - 1e-9:
+        return safe * stack, raw * stack
+    return raw * stack, None
+
+
 def _rows_to_sources(
     item_id: int, tab_id: str, template: str | None, rows, item_name: str = ""
 ) -> list[ItemSource]:
@@ -79,9 +115,9 @@ def _rows_to_sources(
         if not isinstance(row, dict) or _num(row.get("id")) is None:
             continue
         count, outof = _num(row.get("count")), _num(row.get("outof"))
-        chance = None
+        chance = raw = None
         if count is not None and outof:
-            chance = max(0.0, count) / outof
+            chance, raw = _rates(count, outof)
         elif (pct := _num(row.get("percent"))) is not None:
             chance = pct / 100
         loc = row.get("location") or []
@@ -109,6 +145,7 @@ def _rows_to_sources(
                 boss=bool(row.get("boss")),
                 skill=int(sk) if (sk := _num(row.get("skill"))) else None,
                 item_name=item_name,
+                raw_chance=raw,
             )
         )
     return out
@@ -232,6 +269,7 @@ def sources_from_entity_page(record: dict, page_kind: str, entity_id: int) -> li
             count, outof = _num(row.get("count")), _num(row.get("outof"))
             if count is None or not outof:
                 continue
+            chance, raw = _rates(count, outof, _stack_mean(row))
             out.append(
                 ItemSource(
                     item_id=int(row["id"]),
@@ -239,11 +277,12 @@ def sources_from_entity_page(record: dict, page_kind: str, entity_id: int) -> li
                     source_type="npc" if page_kind == "npc" else "object",
                     source_id=entity_id,
                     source_name=name,
-                    chance=max(0.0, count) / outof * _stack_mean(row),
+                    chance=chance,
                     samples=int(outof),
                     zones=(),
                     item_name=str(row.get("name") or "").lstrip("0123456789"),
                     from_page=True,
+                    raw_chance=raw,
                 )
             )
     return out
