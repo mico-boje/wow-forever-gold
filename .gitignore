@@ -23,6 +23,8 @@ data/*.sqlite3-*
 data/profile.json
 data/active_session.json
 data/addon_import.json
+data/remote_sync.json
+data/my_houses.json
 
 # OS / editors
 .DS_Store
@@ -40,3 +42,4 @@ data/vanilla/
 data/discovered/
 # Wowhead pages you captured in your browser (personal use, not for redistribution)
 data/wowhead/
+data/routes.json

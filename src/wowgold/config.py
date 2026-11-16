@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     # GitHub repo ("owner/name") whose collect workflow snapshots the auction houses hourly.
     # Set it and the local collector pulls those snapshots instead of fetching itself.
     wowgold_remote_repo: str = ""
+    # The installed WowGoldLogger addon folder, for routes sent from the Farms page. Empty: look
+    # in the usual WoW folders (C: drive through WSL), e.g. .../Interface/AddOns/WowGoldLogger
+    wowgold_addon_dir: Path | None = None
     # Versioned static namespace observed at launch; Blizzard's plain `static-forever-*`
     # has been reported to 403 at times, so we keep a fallback.
     wowgold_static_version: str = "1.60.1_70399"

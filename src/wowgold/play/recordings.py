@@ -12,7 +12,7 @@ import json
 import os
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from glob import glob
 from pathlib import Path
 from typing import Any
@@ -318,3 +318,22 @@ def auto_import(
     _state_path(data_dir).parent.mkdir(parents=True, exist_ok=True)
     _state_path(data_dir).write_text(json.dumps(state, indent=2))
     return out
+
+
+@dataclass(frozen=True)
+class Money:
+    copper: int
+    character: str | None
+    at: datetime
+
+
+def latest_money(conn: sqlite3.Connection) -> Money | None:
+    """The money total the addon saw last (it logs it at the start and end of a session)."""
+    for rec in load(conn):  # newest first
+        money = [e for e in rec.events if e.code == "$" and e.int(0) is not None]
+        if money:
+            last = max(money, key=lambda e: e.t)
+            return Money(
+                last.int(0) or 0, rec.char.get("name"), rec.started + timedelta(seconds=last.t)
+            )
+    return None

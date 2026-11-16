@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}Resets · wowgold{% endblock %}
+{% block head %}
+<style>
+  .form { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; margin: 12px 0; }
+  .form > div { min-width: 120px; }
+  .stats { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0; }
+  .stat { border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; background: var(--panel); }
+  .stat .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .l { font-size: 12px; color: var(--muted); }
+  .rs { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); overflow: hidden; }
+  .rs-head, .r > summary { display: grid; gap: 10px; align-items: baseline; padding: 8px 14px;
+    grid-template-columns: minmax(0, 1.8fr) 110px 100px 100px 90px 70px 80px minmax(0, 1.6fr); }
+  .rs-head { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase;
+    letter-spacing: .04em; border-bottom: 1px solid var(--line); }
+  .r { border-bottom: 1px solid var(--line); }
+  .r:last-child { border-bottom: 0; }
+  .r > summary { cursor: pointer; list-style: none; }
+  .r > summary::-webkit-details-marker { display: none; }
+  .r > summary:hover, .r[open] > summary { background: var(--chip); }
+  .n { text-align: right; font-variant-numeric: tabular-nums; }
+  .body { padding: 6px 14px 14px; }
+  .ladder td.bought { color: var(--ok); }
+  .risk { color: var(--warn); }
+  .pick { color: var(--ok); font-weight: 600; }
+  @media (max-width: 900px) {
+    .rs-head { display: none; }
+    .r > summary { grid-template-columns: 1fr auto; }
+    .r > summary > span:nth-child(n+3) { grid-column: 1 / 3; text-align: left; }
+  }
+</style>
+{% endblock %}
+{% block main %}
+<h1>Resets</h1>
+<p class="muted">Buy an item's cheap listings and relist them near its normal price. Each reset says what to buy, what to relist at, what it should make once it sells, and the risks: how fast it sells, how fast other sellers restock, and whether the price is moving.</p>
+
+<form class="form panel" method="get" action="/resets">
+  <div><label for="gold">Your gold</label><input id="gold" name="gold" value="{{ gold_text }}" placeholder="{{ (gold | gold) if gold else 'e.g. 120g' }}"></div>
+  <div><label for="share">Use at most</label><select id="share" name="share">
+    {% for p in (25, 50, 75, 100) %}<option value="{{ p }}" {{ 'selected' if share == p }}>{{ p }}% of it</option>{% endfor %}</select></div>
+  <div><label for="days">Sell within</label><select id="days" name="days">
+    {% for d in (1, 2, 3, 5, 7) %}<option value="{{ d }}" {{ 'selected' if days == d }}>{{ d }} day{{ "s" if d > 1 }}</option>{% endfor %}</select></div>
+  <div><label for="faction">Faction</label><select id="faction" name="faction">
+    {% for f in ("horde", "alliance") %}<option value="{{ f }}" {{ 'selected' if faction == f }}>{{ f | capitalize }}</option>{% endfor %}</select></div>
+  <div><button class="primary" type="submit">Find resets</button></div>
+  <div class="small muted" style="flex-basis:100%">
+    {% if money %}Your gold from the WowGold addon: <strong>{{ money.copper | gold }}</strong> on {{ money.character or "your character" }}, as of {{ money.at.strftime("%a %H:%M") }} (UTC). Type an amount to use another.{% else %}No gold recorded by the addon yet: type how much you have.{% endif %}
+  </div>
+</form>
+{% if error %}<div class="note bad">{{ error }}</div>{% endif %}
+{% if res.book %}{% with r = res %}{% include "_house_note.html" %}{% endwith %}{% endif %}
+
+{% if budget %}
+<div class="stats">
+  <div class="stat"><div class="v">{{ budget | gold }}</div><div class="l">to spend ({{ share }}% of {{ gold | gold }})</div></div>
+  {% if picks %}
+  <div class="stat"><div class="v">{{ picks | sum(attribute='cost') | gold }}</div><div class="l">spent by the plan below ({{ picks | length }} reset{{ "s" if picks | length != 1 }})</div></div>
+  <div class="stat"><div class="v pick">+{{ picks | sum(attribute='profit') | gold }}</div><div class="l">expected profit within {{ days | round(1) }} day{{ "s" if days != 1 }}</div></div>
+  {% endif %}
+</div>
+{% endif %}
+
+{% macro row(r, picked) %}
+<details class="r">
+  <summary>
+    <span><a href="https://www.wowhead.com/forever/item={{ r.item_id }}" target="_blank" rel="noopener"><strong>{{ r.name }}</strong></a>{% if picked %} <span class="chip ok" title="In the plan for your budget">plan</span>{% endif %}</span>
+    <span class="n">{{ r.units }} × ≤{{ r.max_paid | gold }}</span>
+    <span class="n">{{ r.cost | gold }}</span>
+    <span class="n">{{ r.relist | gold }}</span>
+    <span class="n pick">+{{ r.profit | gold }}</span>
+    <span class="n">{{ "%.0f" | format(r.roi * 100) }}%</span>
+    <span class="n">{{ "%.1f" | format(r.days_to_sell) if r.days_to_sell is not none else "?" }} d</span>
+    <span class="small risk">{{ r.flags[:2] | join("; ") }}{% if r.flags | length > 2 %} +{{ r.flags | length - 2 }}{% endif %}</span>
+  </summary>
+  <div class="body">
+    <p class="small">Buy every listing up to <strong>{{ r.max_paid | gold }}</strong> each ({{ r.units }} units, {{ r.cost | gold }}){% if r.budget_bound %}, as far as your budget goes{% endif %}. Relist at <strong>{{ r.relist | gold }}</strong>
+      {%- if r.wall and r.relist < r.normal %}, just under the next listing ({{ r.wall | gold }}){% endif %}; it normally trades around {{ r.normal | gold }} (median of {{ r.history_hours }} hours).</p>
+    <p class="small">It sells about <strong>{{ "%.1f" | format(r.sold_per_day) }}/day</strong> and other sellers list about <strong>{{ "%.1f" | format(r.restock_per_day) }}/day</strong> new, so you'd get roughly {{ "%.0f" | format(r.capture * 100) }}% of the sales: ~{{ "%.0f" | format(r.expected_sold) }} of your {{ r.units }} sold within {{ days | round(1) }} days, for {{ r.revenue | gold }} after the AH cut. What's left is counted at {{ r.leftover_value | gold }} (70% of what it cost).</p>
+    {% if r.flags %}<ul class="small risk">{% for f in r.flags %}<li>{{ f }}</li>{% endfor %}</ul>{% endif %}
+    <table class="small ladder" style="width:auto">
+      <thead><tr><th class="num">Price each</th><th class="num">Listed</th><th></th></tr></thead>
+      {% for rung in r.ladder %}
+      <tr><td class="num {{ 'bought' if rung.price <= r.max_paid }}">{{ rung.price | gold }}</td><td class="num">{{ rung.qty }}</td>
+        <td class="muted">{{ "buy" if rung.price <= r.max_paid else ("the wall" if rung.price == r.wall else "") }}</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+</details>
+{% endmacro %}
+
+{% if plans %}
+<h2>Resets for your budget</h2>
+<div class="rs">
+  <div class="rs-head"><span>Item</span><span class="n">Buy</span><span class="n">Cost</span><span class="n">Relist at</span><span class="n">Profit</span><span class="n">Return</span><span class="n">To sell</span><span>Risks</span></div>
+  {% set picked = picks | map(attribute='item_id') | list %}
+  {% for r in plans %}{{ row(r, r.item_id in picked) }}{% endfor %}
+</div>
+<p class="small muted">Profit counts what sells within {{ days | round(1) }} days at your relist price, after the 5% cut, plus what's left valued at 70% of its cost. Deposits aren't counted (you get them back when it sells). <span class="chip ok">plan</span> marks the resets that fit your budget together, best return on your gold first. Items whose price is falling more than 15% a day are left out. Prices and sales come from the hourly snapshots, so a reset can be gone (or bigger) by the time you're at the auction house.</p>
+{% elif budget and not error %}
+<p class="muted">Nothing worth resetting with {{ budget | gold }} right now.</p>
+{% endif %}
+{% endblock %}

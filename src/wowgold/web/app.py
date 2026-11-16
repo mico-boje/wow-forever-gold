@@ -33,13 +33,14 @@ from ..crafting.recipes import recipe_counts
 from ..discovery.discover import CLASS_KILL_SPEED, parse_levels, to_yaml_entries
 from ..discovery.newitems import STATUS_LABEL, STATUS_ORDER
 from ..discovery.service import VanillaCache, run_crafting, run_discover, run_new_items
+from ..ingame import add_route, addon_dirs, load_routes, remove_route, write_routes
 from ..market.firstseen import new_arrivals
 from ..market.myhouse import find_listing, load_my_houses, set_my_house
 from ..market.query import find_items
 from ..market.trends import HORIZON_DAYS, Trend
 from ..methods.models import PROFESSIONS, GearTier
 from ..planner.engine import PlanOptions
-from ..planner.pricing import ah_cut, build_price_book
+from ..planner.pricing import ah_cut, build_price_book, pick_houses
 from ..planner.profile import CharacterProfile
 from ..sessions import load_profile, parse_coins, save_profile
 from ..wowhead.capture import (
@@ -56,6 +57,7 @@ from ..wowhead.capture import (
     script_version,
     userscript,
 )
+from ..wowhead.entities import load_entities
 from ..wowhead.itemlists import list_page_counts
 from ..wowhead.names import fetch_tooltip_names, unnamed_item_ids
 from ..wowhead.refresh import (
@@ -65,6 +67,7 @@ from ..wowhead.refresh import (
     recent_changes,
     save_settings,
 )
+from ..wowhead.zones import zone_queue
 
 TEMPLATES = Path(__file__).parent / "templates"
 CLASSES = sorted(CLASS_KILL_SPEED)
@@ -193,6 +196,8 @@ class SellRate:
     market: int | None
     trend: Trend | None = None
     sell_factor: float = 1.0
+    thin: bool = False  # too few listings and no sales: valued at vendor price
+    auctions: int | None = None
 
     def trend_label(self) -> str:
         return self.trend.label() if self.trend and self.market is not None else ""
@@ -227,6 +232,8 @@ class SellRate:
     def label(self) -> str:
         if self.market is None:
             return "not on AH"
+        if self.thin:
+            return "no sales"
         if self.per_day is None:
             return "?"
         n = self.per_day
@@ -250,6 +257,8 @@ def sell_rate(book, item_id: int) -> SellRate:
         p.market,
         p.trend,
         p.sell_factor,
+        p.thin,
+        p.auctions,
     )
 
 
@@ -539,7 +548,51 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
             saved=saved,
             saved_msg=request.query_params.get("saved"),
             rate=(lambda item_id: sell_rate(res.book, item_id)) if res and res.book else None,
+            routes=load_routes(s.wowgold_data_dir),
+            route_msg=request.query_params.get("route"),
+            addon_found=bool(addon_dirs(s.wowgold_addon_dir)),
         )
+
+    def _back(request: Request, msg: str) -> RedirectResponse:
+        """Back to the Farms page the form came from, with a message."""
+        ref = urlparse(request.headers.get("referer") or "")
+        query = ref.query if ref.path == "/farms" else ""
+        query = "&".join(p for p in query.split("&") if p and not p.startswith("route="))
+        return RedirectResponse(
+            f"/farms?{query}{'&' if query else ''}route={quote(msg)}#routes", status_code=303
+        )
+
+    @app.post("/farms/route")
+    async def send_route(request: Request) -> Response:
+        """Keep a farm's route and write the addon's Routes.lua (shown in RXPGuides)."""
+        if not same_origin(request):
+            return PlainTextResponse("cross-site request refused", status_code=403)
+        form = await request.form()
+        try:
+            route = json.loads(str(form.get("route") or ""))
+            add_route(
+                s.wowgold_data_dir,
+                str(form.get("id") or ""),
+                str(form.get("name") or "route"),
+                str(form.get("zone") or ""),
+                str(form.get("note") or ""),
+                route,
+                int(form["item"]) if str(form.get("item") or "").isdigit() else None,
+            )
+        except (ValueError, TypeError):
+            return _back(request, "error:that route couldn't be read")
+        written = write_routes(s.wowgold_data_dir, s.wowgold_addon_dir)
+        if not written:
+            return _back(request, "noaddon:" + str(form.get("name") or ""))
+        return _back(request, "sent:" + str(form.get("name") or ""))
+
+    @app.post("/farms/route/remove")
+    async def remove_route_post(request: Request) -> Response:
+        if not same_origin(request):
+            return PlainTextResponse("cross-site request refused", status_code=403)
+        remove_route(s.wowgold_data_dir, str((await request.form()).get("id") or ""))
+        write_routes(s.wowgold_data_dir, s.wowgold_addon_dir)
+        return _back(request, "removed:")
 
     @app.post("/profile")
     async def save(request: Request) -> Response:
@@ -626,9 +679,17 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
         if request.query_params.get("submitted"):
             return verify_page(request, saved)
         exclude = set()
+        zones = []
         if cache.available:
-            data, *_ = cache.with_captures()
+            data, _ids, _placed, unplaced = cache.with_captures()
             exclude = set(data.items)
+            known = cache.forever_zone_ids(data, unplaced, load_entities(s.wowgold_data_dir))
+            zones = zone_queue(
+                cache.zones(data),
+                known,
+                saved.faction if saved else "horde",
+                saved.level if saved else None,
+            )
         with connect() as conn:
             houses = s.wowgold_houses or [
                 r["house_id"]
@@ -638,7 +699,9 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
             targets = pick_targets(conn, s.wowgold_region, houses, exclude, limit=40)
             done = captured(s.wowgold_data_dir)
             # what items trade for per day, to rank recaptures and new arrivals
-            book = build_price_book(conn, s.wowgold_region, houses, ah_item_ids(conn, houses))
+            book = build_price_book(
+                conn, s.wowgold_region, houses, ah_item_ids(conn, houses), trends=False
+            )
             arrivals = [
                 (i, ts, book.get(i))
                 for i, ts in new_arrivals(conn, s.wowgold_region).items()
@@ -676,6 +739,7 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
             changes=recent_changes(s.wowgold_data_dir),
             refresh=load_settings(s.wowgold_data_dir),
             saved_msg=request.query_params.get("refresh"),
+            zones=zones,
         )
 
     @app.post("/capture/refresh")
@@ -852,6 +916,83 @@ def create_app(settings: Settings | None = None, cache: VanillaCache | None = No
         return JSONResponse(names_job.state())
 
     # -- houses ------------------------------------------------------------------------------
+
+    # -- auction house resets ----------------------------------------------------------------
+
+    @app.get("/resets", response_class=HTMLResponse)
+    def resets_page(request: Request) -> HTMLResponse:
+        from ..discovery.service import _caps
+        from ..market.myhouse import house_source
+        from ..market.resets import plan_resets
+        from ..play.recordings import latest_money
+        from ..sessions import parse_coins
+        from ..wowhead.vendors import load_vendor_offers
+
+        q = request.query_params
+        saved = load_profile(s.profile_path)
+        faction = q.get("faction") or (saved.faction if saved else "horde")
+        error = None
+        with connect() as conn:
+            money = latest_money(conn)
+            gold_text = (q.get("gold") or "").strip()
+            gold = money.copper if money else 0
+            if gold_text:
+                try:
+                    gold = parse_coins(gold_text.replace(" ", ""))
+                except ValueError as exc:
+                    error = str(exc)
+            try:
+                share = max(1, min(100, int(q.get("share") or 50)))
+                days = max(0.5, min(14.0, float(q.get("days") or 3)))
+            except ValueError:
+                share, days = 50, 3.0
+            budget = gold * share // 100
+            mine = load_my_houses(s.wowgold_data_dir, s.wowgold_region)
+            houses = pick_houses(conn, s.wowgold_region, faction, None, s.wowgold_houses, mine)
+            plans, picks, book = [], [], None
+            if houses and budget > 0:
+                book = build_price_book(conn, s.wowgold_region, houses, ah_item_ids(conn, houses))
+                caps = _caps(load_vendor_offers(s.wowgold_data_dir))
+                plans = plan_resets(
+                    conn,
+                    s.wowgold_region,
+                    houses,
+                    book,
+                    budget,
+                    horizon_days=days,
+                    vendor_caps=caps,
+                )
+                # a plan for the budget: best return on gold first, while the gold lasts
+                left = budget
+                for r in sorted(plans, key=lambda r: -r.roi):
+                    if r.cost <= left:
+                        picks.append(r)
+                        left -= r.cost
+            elif not houses and error is None:
+                error = "No auction data for that faction yet."
+        return render(
+            request,
+            "resets.html",
+            money=money,
+            gold=gold,
+            gold_text=gold_text,
+            share=share,
+            days=days,
+            budget=budget,
+            faction=faction,
+            plans=plans[:60],
+            picks=picks,
+            error=error,
+            res={
+                "house_ids": houses,
+                "house_source": house_source(
+                    houses, faction, explicit=None, configured=s.wowgold_houses, mine=mine
+                )
+                if houses
+                else "guess",
+                "book": book,
+            },
+        )
 
     @app.get("/houses", response_class=HTMLResponse)
     def houses_page(request: Request) -> HTMLResponse:

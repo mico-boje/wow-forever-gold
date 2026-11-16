@@ -31,6 +31,7 @@ from ..wowhead.itemlists import load_item_hints
 from ..wowhead.names import captured_item_names, store_names
 from ..wowhead.sources import ItemSource, load_sources
 from ..wowhead.vendors import VendorOffer, load_vendor_offers
+from ..wowhead.zones import ZonePage, load_zones
 from . import vanilla
 from .discover import (
     Candidate,
@@ -40,6 +41,7 @@ from .discover import (
     find_farms,
     find_leads,
     forever_camps,
+    forever_gathering,
     profile_at_level,
 )
 from .newitems import Overview, build_overview, own_loot
@@ -97,8 +99,30 @@ class VanillaCache:
         base, item_ids = self._base()
         data = dataclasses.replace(base, extra={}, extra_notes={})
         placed, unplaced = data.add_sources(load_sources(self.data_dir))
+        # Forever zones named by their captured Wowhead zone pages
+        data.area_names = {**base.area_names}
+        for zid, z in self.zones(data).items():
+            data.area_names.setdefault(zid, z.name)
         ids = set(item_ids) | {s.item_id for s in placed} | {u.item_id for u in unplaced}
         return data, ids, placed, unplaced
+
+    def zones(self, data: VanillaData) -> dict[int, ZonePage]:
+        """Captured Wowhead zone pages (Forever zones), nodes recognised by vanilla names."""
+        herbs = {n.name for n in data.node_types.values() if n.profession == "herbalism"}
+        ores = {n.name for n in data.node_types.values() if n.profession == "mining"}
+        return load_zones(self.data_dir, herbs, ores)
+
+    def forever_zone_ids(
+        self, data: VanillaData, unplaced: list[ItemSource], entities: dict
+    ) -> set[int]:
+        """Zones your captures mention that aren't in the vanilla database."""
+        vanilla = set(self._base()[0].area_names)
+        ids = {z for u in unplaced for z in u.zones}
+        for e in entities.values():
+            ids |= {p.zone_id for p in e.points if p.zone_id}
+            ids |= set(e.info.zones) if e.info else set()
+        ids |= set(self.zones(data))
+        return {z for z in ids if z not in vanilla}
 
 
 @dataclass
@@ -170,6 +194,8 @@ def run_discover(
         ctx = ctx.with_offers(offers)
     craft_opts = CraftOptions(sell_days=opts.sell_days, market_share=opts.market_share)
     entities = load_entities(cache.data_dir)
+    zone_pages = cache.zones(data)
+    forever_ids = cache.forever_zone_ids(data, unplaced, entities)
     # Forever zones aren't in the vanilla area table; Wowhead's map data names them
     zone_names = {
         p.zone_id: p.zone_name
@@ -194,8 +220,11 @@ def run_discover(
     for level in levels or [profile.level]:
         at = profile_at_level(profile, level) if levels else profile
         fcamps = forever_camps(data, at, book, entities, unplaced, elites=elites)
+        fgather = forever_gathering(data, at, book, entities, unplaced, forever_ids, zone_pages)
         camp_npcs = {c.pages[0][1] for c in fcamps}
-        farms = find_farms(data, at, book, opts, kind=kind, elites=elites, extra=fcamps)
+        farms = find_farms(
+            data, at, book, opts, kind=kind, elites=elites, extra=fcamps, extra_gather=fgather
+        )
         if craft and ctx is not None:
             proc = processing_options(recipes, book, ctx, craft_opts, at.professions)
             for c in farms:
@@ -216,6 +245,7 @@ def run_discover(
             elites=elites,
             entities=entities,
             zone_names=zone_names,
+            zone_pages=zone_pages,
         )[:leads]
         out.results.append(LevelResult(at, farms, found))
     return out

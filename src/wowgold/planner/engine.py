@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..methods.models import Faction, ItemQty, Kind, Method
-from .pricing import ItemPrice, PriceBook, trend_flags
+from .pricing import ItemPrice, PriceBook, thin_flags, trend_flags
 from .profile import CharacterProfile
 
 Z90 = 1.2816  # z-score for the 10th/90th percentile range
@@ -253,6 +253,7 @@ def evaluate(
         ev.flags.append("demand estimated from listings (no sales history yet)")
     sold_on_ah = [ln.item_id for ln in ev.lines if ln.item_id and ln.ah_units]
     ev.flags.extend(trend_flags(book, sold_on_ah))
+    ev.flags.extend(thin_flags(book, [ln.item_id for ln in ev.lines if ln.item_id]))
     return ev
 
 

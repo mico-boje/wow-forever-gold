@@ -287,3 +287,24 @@ def test_plan_cli_smoke(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert "Eastern Plaguelands herbs" in result.output
     assert "house 113" in result.output
+
+
+def test_thin_market_is_valued_at_vendor(tmp_path):
+    from wowgold.planner.pricing import thin_flags
+
+    conn = db.connect(tmp_path / "t.sqlite3")
+    now = datetime(2026, 11, 12, 12, tzinfo=UTC)
+    conn.execute(
+        "INSERT INTO items (item_id, name, sell_price, purchase_price, source, fetched_at)"
+        " VALUES (1, 'Ripped Note', 5, NULL, 'blizzard', 'x')"
+    )
+    ts = now.isoformat(timespec="seconds")
+    # item 1: one listing at 3,500g, never sold; 2: one big stack; 3: rare but it sells
+    _snapshot(conn, 1, 113, ts, [(1, 1, 35_000_000, 0), (2, 500, 7000, 0), (3, 2, 900_000, 1)])
+    book = build_price_book(conn, "eu", [113], {1, 2, 3}, now=now)
+    note = book.get(1)
+    assert note.thin and note.ah_net is None and note.sell_value == 5
+    assert not book.get(2).thin and not book.get(3).thin
+    assert book.get(3).ah_net == round(900_000 * 0.95)
+    (flag,) = thin_flags(book, [1, 2, 3])
+    assert flag.startswith("Ripped Note: 1 listing at 3,500g and no sales seen")
