@@ -143,8 +143,27 @@ class PageChanges:
     changes: list[Change] = field(default_factory=list)
 
 
+_CHANGES_CACHE: dict[tuple, PageChanges | None] = {}
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def page_changes(data_dir: Path, key: str) -> PageChanges | None:
+    """Compared with its previous version; cached until either file changes."""
     path = capture_dir(data_dir) / f"{key}.json"
+    hist = data_dir / "wowhead" / "history" / key
+    stamp = (str(path), _mtime(path), _mtime(hist))
+    if stamp not in _CHANGES_CACHE:
+        _CHANGES_CACHE[stamp] = _page_changes(data_dir, key, path)
+    return _CHANGES_CACHE[stamp]
+
+
+def _page_changes(data_dir: Path, key: str, path: Path) -> PageChanges | None:
     prev = previous_capture(data_dir, key)
     if prev is None or not path.exists():
         return None

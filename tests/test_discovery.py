@@ -541,7 +541,9 @@ def test_npc_page_replaces_vanilla_loot_and_verifies_camp(world, book):
     yields = {i.item for i in after.method.yields}
     assert yields == {HERB}  # vanilla cloth and pattern are gone: Forever table replaces them
     assert after.verified == 1
-    assert any("Forever loot table from Wowhead (n=400)" in e for e in after.evidence)
+    assert any(
+        "Forever loot table from Wowhead (400 kills behind each rate)" in e for e in after.evidence
+    )
 
 
 def test_small_npc_page_only_patches(world, book):
@@ -634,3 +636,67 @@ def test_leads_group_by_zone_and_name(world, book):
 
     tw = by_title["Twilight mobs (2, zone unknown)"]
     assert tw.grouped_by == "name" and "grouped by name" in tw.flags[0]
+
+
+def test_camp_with_nodes_inside_gets_a_gathering_variant(tmp_path, book):
+    from wowgold.discovery.discover import mob_camps
+
+    path = build_world(tmp_path / "mangos.sqlite")
+    rw = sqlite3.connect(path)
+    # a Dreamfoil node right among the ogres (the zone's herbs are ~1,000 yd away)
+    rw.execute(
+        "INSERT INTO gameobject (guid, id, map, position_x, position_y, spawntimesecsmin, "
+        "spawntimesecsmax) VALUES (500, 900, 1, 1030, 1010, 300, 300)"
+    )
+    rw.commit()
+    rw.close()
+    conn = v.connect(path)
+    data = VanillaData.load(conn)
+
+    plain = mob_camps(data, profile(), book)
+    assert not any(c.method.id.endswith("_gather") for c in plain)
+
+    herbalist = profile(professions={"herbalism": 300})
+    cands = {c.method.id: c for c in mob_camps(data, herbalist, book)}
+    (gather,) = [c for i, c in cands.items() if i.endswith("_gather")]
+    base = cands[gather.method.id.removesuffix("_gather")]
+    m = gather.method
+    assert m.name == "Ogre camp + herbalism"
+    assert m.requirements.professions == {"herbalism": 270}
+    # one node, 5-minute respawn: up to 12 pickups an hour, at 21 s each (gather + detour)
+    herb = {i.item: i.qty for i in m.yields}[HERB]
+    assert herb == pytest.approx(12 * 2, rel=0.01)  # 1-3 Dreamfoil per node
+    assert "~12/h (Dreamfoil 12)" in m.description
+    assert {i.item for i in base.method.yields} | {HERB} == {i.item for i in m.yields}
+    conn.close()
+
+
+def test_rates_from_few_kills_are_valued_cautiously(world):
+    from wowgold.wowhead.sources import cautious_rate, sources_from_entity_page
+
+    record = {
+        "title": "Ogre - NPC - Forever",
+        "listviews": {
+            "drops": {
+                "template": {"entityType": 3},
+                "data": [
+                    # the mob's own loot: few kills; a world drop: thousands
+                    {"id": CLOTH, "name": "Runecloth", "count": 16, "outof": 24},
+                    {"id": GLOVES, "name": "Gloves", "count": 8, "outof": 5743},
+                ],
+            }
+        },
+    }
+    srcs = {s.item_id: s for s in sources_from_entity_page(record, "npc", 1)}
+    assert srcs[CLOTH].cautious and srcs[CLOTH].raw_chance == pytest.approx(16 / 24)
+    assert srcs[CLOTH].chance == pytest.approx(cautious_rate(16, 24))
+    assert not srcs[GLOVES].cautious and srcs[GLOVES].chance == pytest.approx(8 / 5743)
+
+    data = VanillaData.load(world)
+    data.add_sources(list(srcs.values()))
+    notes = data.extra_notes[("creature", 1)]
+    assert notes[0].startswith("Forever loot table from Wowhead (24–5,743 kills behind each rate)")
+    assert any(
+        "few kills behind some Wowhead rates (from 24), valued cautiously: Runecloth 67% → 54%" in n
+        for n in notes
+    )

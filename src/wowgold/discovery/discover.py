@@ -28,6 +28,7 @@ from ..planner.pricing import PriceBook
 from ..planner.profile import CharacterProfile
 from ..wowhead.sources import ItemSource
 from . import vanilla as v
+from .routes import Route, make_route
 from .zones import ZoneIndex, build_zone_index
 
 # -- model constants (guesses; tune once sessions measure real rates) ---------------------------
@@ -67,6 +68,8 @@ MAX_LEVELS_ABOVE = 2  # skip mobs more than this many levels above you
 SPEED_YD_S = 7.0 * 1.6  # ground mount; the planner scales gathering for no mount / epic mount
 ROUTE_FACTOR = 1.5  # real paths vs. straight lines, and nodes you can't reach first
 GATHER_S = 6.0  # dismount, cast, loot
+# A herb or ore node inside a mob camp: gather it plus a short detour on foot between pulls.
+CAMP_NODE_DETOUR_S = 15.0
 NODE_CELL = 250.0
 YIELD_REL_SD = 0.5  # hypothesis yields: ±50% (1 sd)
 MIN_YIELD_COPPER_H = 2000  # items worth less than 20s/h go into the vendor bucket
@@ -120,6 +123,8 @@ class VanillaData:
                 node_by_name[nt.name].append(nt.entry)
         placed, unplaced = [], []
         page_samples: dict[tuple[str, int], int] = {}
+        page_min: dict[tuple[str, int], int] = {}
+        few: dict[tuple[str, int], list[ItemSource]] = defaultdict(list)
         for src in sources:
             if src.chance is None or src.chance <= 0:
                 continue
@@ -141,6 +146,10 @@ class VanillaData:
             if src.from_page:
                 for key in keys:
                     page_samples[key] = max(page_samples.get(key, 0), src.samples or 0)
+                    if src.samples:
+                        page_min[key] = min(page_min.get(key, src.samples), src.samples)
+                    if src.cautious:
+                        few[key].append(src)
                 note = None  # summarised once per page below
             else:
                 note = f"Wowhead: {src.chance:.1%} item {src.item_id}" + (
@@ -155,9 +164,28 @@ class VanillaData:
         for key, n in page_samples.items():
             if n >= PAGE_REPLACE_MIN_SAMPLES:
                 self.replaced[key] = n
+                lo = page_min.get(key, n)
+                kills = f"{lo:,}" if lo == n else f"{lo:,}–{n:,}"
                 self.extra_notes.setdefault(key, []).insert(
-                    0, f"Forever loot table from Wowhead (n={n}), plus rare drops too rare to show"
+                    0,
+                    f"Forever loot table from Wowhead ({kills} kills behind each rate), "
+                    "plus rare drops too rare to show",
                 )
+        # one line per page for rates resting on few kills, most likely drops first
+        for key, srcs in few.items():
+            srcs.sort(key=lambda s: -(s.raw_chance or 0))
+            parts = [
+                f"{s.item_name or f'item {s.item_id}'} {s.raw_chance:.0%} → {s.chance:.0%}"
+                for s in srcs[:3]
+            ]
+            more = f" +{len(srcs) - 3} more" if len(srcs) > 3 else ""
+            n_few = min(s.samples or 0 for s in srcs)
+            self.extra_notes.setdefault(key, []).insert(
+                1 if key in self.replaced else 0,
+                f"few kills behind some Wowhead rates (from {n_few}), valued cautiously: "
+                + ", ".join(parts)
+                + more,
+            )
         return placed, unplaced
 
 
@@ -174,6 +202,7 @@ class Candidate:
     # "craft before selling": extra copper/h from crafting the yields, and how
     craft_extra: float = 0.0
     craft_notes: list[str] = field(default_factory=list)
+    route: Route | None = None  # where to go, for an in-game route (RXPGuides)
 
     @property
     def total_per_hour(self) -> float:
@@ -375,15 +404,33 @@ def mob_camps(
 
     # supply (respawns per hour) per cell per creature
     cells: dict[tuple[int, int, int], dict[int, float]] = defaultdict(lambda: defaultdict(float))
+    positions: dict[tuple[int, int, int], list[tuple[int, float, float]]] = defaultdict(list)
     for s in data.creature_spawns:
         if s.entry in ev:
             respawn = data.respawn.get(s.entry, s.respawn_s)
-            cells[(s.map, int(s.x // CELL), int(s.y // CELL))][s.entry] += (
-                3600 / respawn * s.p_active
-            )
+            key = (s.map, int(s.x // CELL), int(s.y // CELL))
+            cells[key][s.entry] += 3600 / respawn * s.p_active
+            positions[key].append((s.entry, s.x, s.y))
+
+    # Herb/ore nodes you can gather, keyed negative so they share the allocation with mobs.
+    node_ev: dict[int, float] = {}
+    for nt in data.node_types.values():
+        if profile.professions.get(nt.profession, 0) >= max(nt.skill, 1):
+            value = sum(q * unit_value(i, data, book) for i, q in node_loot(nt, data).items())
+            if value * nt.rolls > 0:
+                node_ev[nt.entry] = value * nt.rolls
+    node_rate = 3600 / (GATHER_S + CAMP_NODE_DETOUR_S)
+    if node_ev:
+        for s in data.node_spawns:
+            if s.entry in node_ev:
+                key = (s.map, int(s.x // CELL), int(s.y // CELL))
+                cells[key][-s.entry] += 3600 / s.respawn_s * s.p_active
+                positions[key].append((-s.entry, s.x, s.y))
+    for entry, value in node_ev.items():
+        ev[-entry], rate[-entry] = value, node_rate
 
     def allocate(supply: dict[int, float]) -> tuple[float, dict[int, float]]:
-        """Spend one hour killing the most valuable mobs first."""
+        """Spend one hour on the most valuable targets first (kills, and nodes if gathering)."""
         time_left, kills, value = 1.0, {}, 0.0
         for entry in sorted(supply, key=lambda e: -ev[e] * rate[e]):
             n = min(supply[entry], time_left * rate[entry])
@@ -401,11 +448,20 @@ def mob_camps(
             for dy in (-1, 0, 1):
                 for entry, n in cells.get((map_id, cx + dx, cy + dy), {}).items():
                     supply[entry] += n
-        value, kills = allocate(supply)
-        windows.append((value, map_id, cx, cy, kills))
+        mob_supply = {e: n for e, n in supply.items() if e > 0}
+        if not mob_supply:
+            continue  # a camp needs mobs; nodes alone are gathering zones
+        value, kills = allocate(mob_supply)
+        mixed = None
+        if len(mob_supply) < len(supply):
+            mixed_value, mixed_kills = allocate(supply)
+            if any(e < 0 for e in mixed_kills) and mixed_value > value:
+                mixed = mixed_kills
+                value = mixed_value  # rank windows by the better of the two
+        windows.append((value, map_id, cx, cy, kills, mixed))
     windows.sort(key=lambda w: -w[0])
 
-    chosen: list[tuple[float, int, int, int, dict[int, float]]] = []
+    chosen: list[tuple] = []
     for w in windows:
         if len(chosen) >= limit:
             break
@@ -417,15 +473,32 @@ def mob_camps(
         chosen.append(w)
 
     out = []
-    for _, map_id, cx, cy, kills in chosen:
+    for _, map_id, cx, cy, kills, mixed in chosen:
         x, y = (cx + 0.5) * CELL, (cy + 0.5) * CELL
         zone = data.zones.zone_at(map_id, x, y) or ("Eastern Kingdoms", "Kalimdor")[map_id]
         mobs = sorted(kills, key=lambda e: -kills[e] * ev[e])
-        out.extend(_camp_methods(data, profile, book, zone, map_id, x, y, mobs, kills))
+        cands = _camp_methods(data, profile, book, zone, map_id, x, y, mobs, kills, mixed)
+        here = [
+            p
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            for p in positions.get((map_id, cx + dx, cy + dy), ())
+        ]
+        for c in cands:
+            use = mixed if c.method.id.endswith("_gather") else kills
+            c.route = make_route(
+                "world",
+                map_id,
+                [(px, py) for e, px, py in here if e in use],
+                mobs=[data.creatures[e].name for e in mobs if e > 0],
+            )
+        out.extend(cands)
     return out
 
 
-def _camp_methods(data, profile, book, zone, map_id, x, y, mobs, kills) -> list[Candidate]:
+def _camp_methods(
+    data, profile, book, zone, map_id, x, y, mobs, kills, mixed=None
+) -> list[Candidate]:
     creatures = [data.creatures[e] for e in mobs]
     top = creatures[0]
     names = ", ".join(dict.fromkeys(c.name for c in creatures[:3]))
@@ -503,6 +576,24 @@ def _camp_methods(data, profile, book, zone, map_id, x, y, mobs, kills) -> list[
             verified=verified,
         )
     ]
+    if mixed:
+        cands.append(
+            _camp_with_gathering(
+                data,
+                profile,
+                book,
+                zone,
+                creatures,
+                mixed,
+                base_id,
+                desc,
+                evidence,
+                risk,
+                Requirements(level=level, faction=faction, gear=gear),
+                pages,
+                verified,
+            )
+        )
     if skin_per_hour:
         skill = skinning_skill_for(max(c.level_max for c in creatures if c.skinning_loot_id))
         merged = defaultdict(float, per_hour)
@@ -532,6 +623,84 @@ def _camp_methods(data, profile, book, zone, map_id, x, y, mobs, kills) -> list[
             )
         )
     return cands
+
+
+def _camp_with_gathering(
+    data,
+    profile,
+    book,
+    zone,
+    creatures,
+    mixed,
+    base_id,
+    desc,
+    evidence,
+    risk,
+    reqs,
+    pages,
+    verified,
+) -> Candidate:
+    """The camp with the herb/ore nodes inside it gathered between pulls (and skinning, if
+    you can skin these mobs): `mixed` is the hour split between kills (entry > 0) and node
+    pickups (-entry)."""
+    top = creatures[0]
+    per_hour: dict[int, float] = defaultdict(float)
+    coins = 0.0
+    skins_needed = 0
+    profs: dict[str, int] = {}
+    node_lines: dict[str, float] = defaultdict(float)
+    for e, n in mixed.items():
+        if e > 0:
+            c = data.creatures[e]
+            coins += n * (c.gold_min + c.gold_max) / 2
+            for item, q in creature_loot(c, data).items():
+                per_hour[item] += n * q
+            if can_pickpocket(c, profile):
+                for item, q in pickpocket_loot(c, data).items():
+                    per_hour[item] += n * q
+            need = skinning_skill_for(c.level_max)
+            if c.skinning_loot_id and profile.professions.get("skinning", 0) >= need:
+                skins_needed = max(skins_needed, need)
+                for item, q in skinning_loot(c, data).items():
+                    per_hour[item] += n * q
+        else:
+            nt = data.node_types[-e]
+            profs[nt.profession] = max(profs.get(nt.profession, 0), nt.skill)
+            node_lines[nt.name] += n
+            for item, q in node_loot(nt, data).items():
+                per_hour[item] += n * q * nt.rolls
+    if skins_needed:
+        profs["skinning"] = skins_needed
+    gathered = [p for p in ("skinning", "herbalism", "mining") if p in profs]
+    nodes_h = sum(node_lines.values())
+    by_count = sorted(node_lines.items(), key=lambda kv: -kv[1])
+    top_nodes = ", ".join(f"{name} {n:.0f}" for name, n in by_count[:4])
+    what = " and ".join(
+        p
+        for p in ("herb", "ore")
+        if (p == "herb" and "herbalism" in profs) or (p == "ore" and "mining" in profs)
+    )
+    method = _method_from_rates(
+        mid=base_id + "_gather",
+        name=f"{top.name} camp + " + ", ".join(gathered),
+        kind=Kind.FARM,
+        zone=zone,
+        reqs=reqs.model_copy(update={"professions": profs}),
+        items_per_hour=per_hour,
+        coins_per_hour=coins,
+        data=data,
+        book=book,
+        description=(
+            f"{desc} Between pulls, gather the {what} nodes in the camp: ~{nodes_h:.0f}/h "
+            f"({top_nodes})."
+        ),
+        risk=risk,
+    )
+    extra = [
+        f"{name}: ~{n:.0f} nodes/h in the camp"
+        for name, n in sorted(node_lines.items(), key=lambda kv: -kv[1])
+    ]
+    return Candidate(method, evidence + extra, group=base_id, pages=pages, verified=verified)
 
 
 # -- gathering -----------------------------------------------------------------------------------
@@ -640,6 +809,10 @@ def gathering_zones(
                 by_name.setdefault(data.node_types[entry].name, entry)
             pages = [("object", e, name) for name, e in by_name.items()]
             verified = sum(("node", e) in data.replaced for _, e, _ in pages)
+            maps = defaultdict(list)
+            for sp in use:
+                maps[sp.map].append((sp.x, sp.y))
+            route_map, route_pts = max(maps.items(), key=lambda kv: len(kv[1]))
             out.append(
                 Candidate(
                     method,
@@ -647,6 +820,7 @@ def gathering_zones(
                     group=f"gather:{prof}:{zone}",
                     pages=pages,
                     verified=verified,
+                    route=make_route("world", route_map, route_pts),
                 )
             )
     return out
@@ -714,6 +888,7 @@ def find_farms(
     kind: str = "all",
     elites: bool = False,
     extra: list[Candidate] | None = None,
+    extra_gather: list[Candidate] | None = None,
 ) -> list[Candidate]:
     cands: list[Candidate] = []
     if kind in ("all", "farm"):
@@ -721,6 +896,7 @@ def find_farms(
         cands += extra or []
     if kind in ("all", "gather"):
         cands += gathering_zones(data, profile, book)
+        cands += extra_gather or []
     return rank(cands, profile, book, opts)
 
 
@@ -821,10 +997,22 @@ class Lead:
         return self.members[0] if self.members else None
 
 
-def _enrich(src: ItemSource, entities: dict | None) -> ItemSource:
-    """Fill a source's level, zones and hostility from its captured NPC/object page."""
+def _enrich(src: ItemSource, entities: dict | None, zone_npcs: dict | None = None) -> ItemSource:
+    """Fill a source's level, zones and hostility from its captured NPC/object page, or else
+    from a captured zone page that lists the NPC."""
     ent = (entities or {}).get((src.source_type, src.source_id))
     info = ent.info if ent else None
+    if info is None and src.source_type == "npc" and zone_npcs and src.source_id in zone_npcs:
+        zid, n = zone_npcs[src.source_id]
+        return replace(
+            src,
+            level=src.level or n.level,
+            zones=src.zones or (zid,),
+            react=src.react or n.react,
+            elite=src.elite or n.elite,
+            boss=src.boss or n.boss,
+            source_name=src.source_name or n.name,
+        )
     if info is None:
         return src
     return replace(
@@ -971,6 +1159,7 @@ def find_leads(
     elites: bool = False,
     entities: dict | None = None,
     zone_names: dict[int, str] | None = None,
+    zone_pages: dict | None = None,
 ) -> list[Lead]:
     """Rank sources we can't build a camp for: value of the captured items alone, assuming the
     mobs/nodes are plentiful. A lead says where to look, not what it pays.
@@ -978,10 +1167,11 @@ def find_leads(
     Mobs in the same zone become one lead ("clear the area"): their drops add up, at a kill
     rate mixed from each mob's. Mobs with no known zone group by name family (Twilight Peon,
     Twilight Grunt, ...). Objects (chests, nodes) stay single."""
+    zone_npcs = {n.id: (zid, n) for zid, z in (zone_pages or {}).items() for n in z.npcs}
     by_source: dict[tuple[str, int], list[ItemSource]] = defaultdict(list)
     for src in unplaced:
         if src.chance and src.chance > 0:
-            by_source[(src.source_type, src.source_id)].append(_enrich(src, entities))
+            by_source[(src.source_type, src.source_id)].append(_enrich(src, entities, zone_npcs))
     # an item page and the NPC's own page can both list a drop: keep the bigger sample
     for key, rows in by_source.items():
         best: dict[tuple[str, int], ItemSource] = {}
@@ -1211,6 +1401,12 @@ def forever_camps(
             f"Wowhead: {s.chance:.1%} item {s.item_id}" + (f" (n={s.samples})" if s.samples else "")
             for s in sorted(sources, key=lambda s: -(s.chance or 0))[:5]
         ]
+        near = [
+            p
+            for p in ent.points
+            if p.zone_id == zone_id and max(abs(p.x - x), abs(p.y - y)) <= 1.5 * MAP_CELL_PCT
+        ]
+        ui_map = next((p.ui_map_id for p in near if p.ui_map_id), None)
         out.append(
             Candidate(
                 method,
@@ -1218,6 +1414,140 @@ def forever_camps(
                 group=f"fcamp:{npc_id}",
                 pages=[("npc", npc_id, name)],
                 verified=1 if samples >= PAGE_REPLACE_MIN_SAMPLES else 0,
+                route=make_route("map", ui_map, [(p.x, p.y) for p in near], mobs=[name])
+                if ui_map
+                else None,
             )
         )
+    return out
+
+
+# -- gathering loops in Forever zones (node positions from Wowhead) -------------------------------
+
+# Wowhead's map positions are percentages of the zone map. Forever zones' sizes aren't known, so
+# assume a typical zone width; and node respawns aren't published, so borrow vanilla's typical
+# respawn and share of spawn points up at once for that profession.
+FOREVER_ZONE_YD = 3500.0
+
+
+def _vanilla_node_norms(data: VanillaData) -> dict[str, tuple[float, float]]:
+    """profession -> (median respawn seconds, average share of spawn points up at once)."""
+    by_prof: dict[str, list[v.Spawn]] = defaultdict(list)
+    for s in data.node_spawns:
+        by_prof[data.node_types[s.entry].profession].append(s)
+    out = {}
+    for prof, spawns in by_prof.items():
+        respawns = sorted(s.respawn_s for s in spawns)
+        out[prof] = (respawns[len(respawns) // 2], sum(s.p_active for s in spawns) / len(spawns))
+    return out
+
+
+def forever_gathering(
+    data: VanillaData,
+    profile: CharacterProfile,
+    book: PriceBook,
+    entities: dict,
+    unplaced: list[ItemSource],
+    forever_zones: set[int],
+    zone_pages: dict | None = None,
+) -> list[Candidate]:
+    """Herb and ore loops in Forever zones, from captured object pages' map positions (and the
+    zone pages saying which objects are herbs or veins). Loot is the vanilla node's for nodes
+    vanilla knows, otherwise the drop rates captured on the object's page."""
+    zone_pages = zone_pages or {}
+    kinds = {o.id: o for z in zone_pages.values() for o in z.objects}
+    loot: dict[int, dict[int, float]] = defaultdict(dict)
+    for src in unplaced:
+        if src.source_type == "object" and src.chance:
+            loot[src.source_id][src.item_id] = src.chance
+    norms = _vanilla_node_norms(data)
+
+    # (zone, profession) -> object id -> points in that zone
+    groups: dict[tuple[int, str], dict[int, list]] = defaultdict(dict)
+    meta: dict[int, tuple[str, int | None, str]] = {}  # id -> (profession, skill, name)
+    for (kind, oid), ent in entities.items():
+        if kind != "object" or not ent.points:
+            continue
+        nt = data.node_types.get(oid)
+        zo = kinds.get(oid)
+        if nt is not None:
+            prof, skill, name = nt.profession, nt.skill, nt.name
+        elif zo is not None and zo.profession:
+            prof, skill, name = zo.profession, zo.skill, zo.name
+        else:
+            continue
+        if prof not in ("herbalism", "mining") or not profile.professions.get(prof):
+            continue
+        if skill and profile.professions[prof] < skill:
+            continue
+        meta[oid] = (prof, skill, name)
+        for p in ent.points:
+            if p.zone_id in forever_zones:
+                groups[(p.zone_id, prof)].setdefault(oid, []).append(p)
+
+    cell_pct = NODE_CELL / FOREVER_ZONE_YD * 100
+    out = []
+    for (zid, prof), by_obj in groups.items():
+        respawn, share = norms.get(prof, (900.0, 0.35))
+        per_node: dict[int, dict[int, float]] = {}
+        for oid in by_obj:
+            nt = data.node_types.get(oid)
+            if nt is not None:
+                per_node[oid] = {i: q * nt.rolls for i, q in node_loot(nt, data).items()}
+            elif loot.get(oid):
+                per_node[oid] = loot[oid]
+        by_obj = {o: pts for o, pts in by_obj.items() if per_node.get(o)}
+        if not by_obj:
+            continue
+        points = [p for pts in by_obj.values() for p in pts]
+        cells = {(int(p.x // cell_pct), int(p.y // cell_pct)) for p in points}
+        area = len(cells) * NODE_CELL**2
+        active = {o: len(pts) * share for o, pts in by_obj.items()}
+        supply = {o: a * 3600 / respawn for o, a in active.items()}
+        total_active = sum(active.values())
+        spacing = 0.5 / math.sqrt(total_active / area)
+        per_node_s = ROUTE_FACTOR * spacing / SPEED_YD_S + GATHER_S
+        nodes = _share_nodes(3600 / per_node_s, active, supply)
+        per_hour: dict[int, float] = defaultdict(float)
+        for oid, n in nodes.items():
+            for item, q in per_node[oid].items():
+                per_hour[item] += n * q
+        zone = (
+            (zone_pages[zid].name if zid in zone_pages else None)
+            or next((p.zone_name for p in points if p.zone_name), None)
+            or data.area_names.get(zid)
+            or f"zone {zid}"
+        )
+        zpage = zone_pages.get(zid)
+        level = (zpage.level[0] if zpage and zpage.level else None) or 1
+        skills = [meta[o][1] for o in by_obj if meta[o][1]]
+        unknown_skill = any(not meta[o][1] for o in by_obj)
+        evidence = [
+            f"{meta[o][2]}: {len(by_obj[o])} spawn points on Wowhead's map, ~{nodes[o]:.0f}/h"
+            for o in sorted(by_obj, key=lambda o: -nodes[o])
+        ]
+        method = _method_from_rates(
+            mid=f"hyp_{prof}_{_slug(zone)}_forever",
+            name=f"{prof.capitalize()} in {zone}",
+            kind=Kind.GATHER,
+            zone=zone,
+            reqs=Requirements(level=level, professions={prof: max(skills, default=1)}),
+            items_per_hour=per_hour,
+            coins_per_hour=0,
+            data=data,
+            book=book,
+            description=(
+                f"Ride a loop through {zone} (new in Forever) gathering "
+                f"{', '.join(meta[o][2] for o in by_obj)}. {len(points)} spawn points on "
+                f"Wowhead's map; assumed ~{share:.0%} up at once and a "
+                f"{respawn / 60:.0f}-minute respawn (vanilla's typical), and a "
+                f"{FOREVER_ZONE_YD:.0f}-yard-wide zone: ~{sum(nodes.values()):.0f} nodes/h."
+                + (" Required skill unknown for some nodes." if unknown_skill else "")
+            ),
+            risk=["competition", "assumed_respawn"],
+        )
+        pages = [("object", o, meta[o][2]) for o in by_obj]
+        ui_map = next((p.ui_map_id for p in points if p.ui_map_id), None)
+        route = make_route("map", ui_map, [(p.x, p.y) for p in points]) if ui_map else None
+        out.append(Candidate(method, evidence, pages=pages, verified=len(pages), route=route))
     return out

@@ -72,7 +72,7 @@
     </div>
     <div class="panel">
       <strong>Wowhead item lists</strong>
-      <p class="small muted" style="margin:4px 0">Each list shows where its items come from. Capture them with the userscript (version 4).</p>
+      <p class="small muted" style="margin:4px 0">Each list shows where its items come from. Capture them with the userscript.</p>
       <table class="small">
         {% for key, name, url, count in list_pages %}
         <tr><td class="st" style="color:var(--ok)">{{ "✓" if key in done }}</td><td><a href="{{ url }}" target="_blank" rel="noopener">{{ name }}</a></td>

@@ -367,3 +367,63 @@ def test_panel_and_minimap_button_build(lua):
     assert "Last session" in panel.status.text and not button.dot.shown
     g.slash("minimap")
     assert not button.shown
+
+
+MIDNIGHT = r"""
+-- Forever's client (Midnight engine): secret values exist, the combat log is off limits.
+SECRET = setmetatable({}, { __tostring = function() error("secret value used") end })
+function issecretvalue(v) return v == SECRET end
+units = {}  -- unit token -> { guid, dead, denied }
+function UnitGUID(unit)
+    if unit == "player" then return "Player-1-00000001" end
+    return units[unit] and units[unit].guid
+end
+function UnitIsDead(unit) return units[unit] and units[unit].dead end
+function UnitIsTapDenied(unit) return units[unit] and units[unit].denied end
+"""
+
+
+@pytest.fixture
+def midnight():
+    rt = lua51.LuaRuntime(unpack_returned_tuples=True)
+    rt.execute(WOW_STUBS)
+    rt.execute(MIDNIGHT)
+    rt.execute(ADDON.read_text())
+    rt.execute(ADDON_UI.read_text())
+    rt.globals().fire("ADDON_LOADED", "WowGoldLogger")
+    return rt
+
+
+def test_kills_without_the_combat_log(midnight):
+    lua = midnight
+    g = lua.globals()
+    registered = {e for f in g.frames.values() for e in f.events}
+    assert "COMBAT_LOG_EVENT_UNFILTERED" not in registered
+    assert "LOOT_OPENED" in registered and not g.WowGoldLogger.useCombatLog
+    g.slash("start")
+    tick(lua, 10)
+    # looting a corpse: a kill (once, however often you open it)
+    corpse = g.guid(GRYPHON, "A1")
+    lua.execute(f'loot = {{ {{ "{corpse}", {FEATHER}, 1 }} }}')
+    g.fire("LOOT_OPENED")
+    g.fire("LOOT_OPENED")
+    # your dead target, tapped by you, with no loot to open
+    lua.execute(f'units.target = {{ guid = guid({BEAR}, "B1"), dead = true, denied = false }}')
+    g.updater(None, 1)
+    g.updater(None, 1)
+    # a mob someone else killed, seen as its nameplate goes away
+    lua.execute(
+        f'units.nameplate3 = {{ guid = guid({GRYPHON}, "C1"), dead = true, denied = true }}'
+    )
+    g.fire("NAME_PLATE_UNIT_REMOVED", "nameplate3")
+    # secret values are skipped, not used
+    lua.execute("units.target = { guid = SECRET, dead = true }")
+    g.updater(None, 1)
+    g.fire("CHAT_MSG_MONEY", g.SECRET)
+    g.fire("UNIT_SPELLCAST_SUCCEEDED", "player", "Cast-1", g.SECRET)
+    log = events(lua)
+    kills = [e for e in log if "|K|" in e]
+    assert kills == ["10|K|2347|A1|40|50", "10|K|2356|B1|40|50"]
+    assert "10|D|2347|C1" in log and not any("|M|" in e for e in log)
+    assert "10|A|" in log  # the cast, with its secret spell id left out
+    assert g.WowGoldLogger.current().kills == 2

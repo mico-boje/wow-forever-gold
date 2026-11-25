@@ -2,17 +2,23 @@
 # hours when your own computer is off aren't lost. Your machine's collector downloads these
 # (`wowgold remote sync`, or `collect` with WOWGOLD_REMOTE_REPO set) and ingests them locally.
 #
-# Needs repository secrets BLIZZARD_CLIENT_ID and BLIZZARD_CLIENT_SECRET. Scheduled runs only
-# happen on the default branch; GitHub may start them a few minutes late.
+# GitHub delays and drops scheduled runs (an hourly schedule ran about 4 times a day), so the
+# runs chain themselves: each one snapshots, waits out the hour, then starts the next. The
+# schedule is only a watchdog that restarts the chain if it ever stops; the concurrency group
+# keeps a single chain (a newer pending run replaces an older pending one).
+#
+# Needs repository secrets BLIZZARD_CLIENT_ID and BLIZZARD_CLIENT_SECRET. Runs from the default
+# branch.
 name: Collect auction snapshots
 
 on:
   schedule:
-    - cron: "40 * * * *" # done before the local collector's :05 run
+    - cron: "17,47 * * * *" # watchdog
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: write # to start the next run of the chain
 
 concurrency:
   group: collect
@@ -21,8 +27,11 @@ concurrency:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 75
     steps:
+      - name: Note the start
+        run: echo "STARTED=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - uses: astral-sh/setup-uv@v5
@@ -48,3 +57,15 @@ jobs:
           retention-days: 30
           compression-level: 0 # the snapshots are gzipped already
           if-no-files-found: error
+
+      - name: Wait out the hour
+        if: always()
+        run: |
+          left=$(( 3540 - ($(date +%s) - STARTED) ))
+          if [ "$left" -gt 0 ]; then sleep "$left"; fi
+
+      - name: Start the next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run collect.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"

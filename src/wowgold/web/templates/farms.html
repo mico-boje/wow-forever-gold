@@ -69,7 +69,7 @@
 
 {% macro rate_span(item_id, produced) -%}
   {%- if rate -%}{%- set r = rate(item_id) -%}{%- set days = r.days_to_sell(produced) -%}
-  <span class="rate{{ ' slow' if days and days > form.sell_days }}" title="{% if r.market is none %}No AH listings: valued at vendor price{% else %}{{ 'Sold per day on the AH (measured)' if r.measured else 'Estimated sales per day (from listings; measured once the collector has 12h of history)' }}; {{ '{:,}'.format(r.listed) }} listed{% if days %}; your session's {{ '%.0f' | format(produced) }} = {{ '%.1f' | format(days) }} days of sales{% endif %}{% endif %}">{{ r.label() }}</span>{% if r.trend_label() %} <span class="trend {{ r.trend_class }}" title="{{ r.trend_title() }}">{{ r.trend_label() }}</span>{% endif %}
+  <span class="rate{{ ' slow' if days and days > form.sell_days or r.thin }}" title="{% if r.market is none %}No AH listings: valued at vendor price{% elif r.thin %}Thin market: {{ r.auctions }} listing(s), {{ r.listed }} unit(s), and no sale seen in a week. Valued at vendor price until a sale proves the AH price{% else %}{{ 'Sold per day on the AH (measured)' if r.measured else 'Estimated sales per day (from listings; measured once the collector has 12h of history)' }}; {{ '{:,}'.format(r.listed) }} listed{% if days %}; your session's {{ '%.0f' | format(produced) }} = {{ '%.1f' | format(days) }} days of sales{% endif %}{% endif %}">{{ r.label() }}</span>{% if r.trend_label() %} <span class="trend {{ r.trend_class }}" title="{{ r.trend_title() }}">{{ r.trend_label() }}</span>{% endif %}
   {%- endif -%}
 {%- endmacro %}
 
@@ -105,11 +105,11 @@
         <tr>
           {% if ln.item_id %}{% set r = rate(ln.item_id) if rate else none %}
           <td>{{ ln.name }}</td>
-          <td class="num">{{ "%.0f" | format(ln.produced) }}</td>
+          <td class="num">{% if 0 < ln.produced < 0.5 %}<span class="small muted" title="{{ '%.3f' | format(ln.produced) }} expected per session">1 in {{ (1 / ln.produced) | round | int }} sessions</span>{% else %}{{ "%.0f" | format(ln.produced) }}{% endif %}</td>
           <td class="num">{{ rate_span(ln.item_id, ln.produced) }}</td>
           <td class="num small muted">{{ "{:,}".format(r.listed) if r and r.market is not none else "" }}</td>
-          <td class="num small">{{ r.market | gold if r and r.market is not none else "" }}{% if r and r.market is not none and r.sell_factor < 0.995 %}<br><span class="trend down" title="{{ r.trend_title() }}">→ {{ (r.market * r.sell_factor) | round | int | gold }}</span>{% endif %}</td>
-          <td class="small muted">{% if ln.vendor_units >= 0.5 and ln.ah_units %}{{ "%.0f" | format(ln.ah_units) }} AH, {{ "%.0f" | format(ln.vendor_units) }} vendor{% elif ln.vendor_units >= 0.5 %}vendor{% else %}AH{% endif %}</td>
+          <td class="num small{{ ' muted' if r and r.thin }}"{% if r and r.thin %} style="text-decoration: line-through" title="Not a market price: {{ r.auctions }} listing(s) and no sales"{% endif %}>{{ r.market | gold if r and r.market is not none else "" }}{% if r and r.market is not none and r.sell_factor < 0.995 %}<br><span class="trend down" title="{{ r.trend_title() }}">→ {{ (r.market * r.sell_factor) | round | int | gold }}</span>{% endif %}</td>
+          <td class="small muted">{% if r and r.thin %}vendor (thin market){% elif ln.vendor_units >= 0.5 and ln.ah_units %}{{ "%.0f" | format(ln.ah_units) }} AH, {{ "%.0f" | format(ln.vendor_units) }} vendor{% elif ln.ah_units < 0.0001 and ln.vendor_units > 0 %}vendor{% elif ln.vendor_units >= 0.5 %}vendor{% else %}AH{% endif %}</td>
           {% else %}
           <td colspan="6">coins + vendor trash</td>
           {% endif %}
@@ -121,6 +121,19 @@
       {% if c.craft_notes %}<p class="small"><strong>Craft before selling</strong> (+{{ c.craft_extra | gold }}/h):</p>
       <ul class="small">{% for n in c.craft_notes %}<li>{{ n }}</li>{% endfor %}</ul>{% endif %}
       {% if ev.flags %}<ul class="small muted">{% for fl in ev.flags %}<li>{{ fl }}</li>{% endfor %}</ul>{% endif %}
+      {% if c.route %}
+      <form method="post" action="/farms/route" class="route-form" style="margin:8px 0">
+        <input type="hidden" name="id" value="{{ m.id }}">
+        <input type="hidden" name="name" value="{{ m.name }}">
+        <input type="hidden" name="zone" value="{{ m.zone }}">
+        <input type="hidden" name="note" value="{{ m.name }} ({{ m.zone }}): {{ ev.gold_per_hour | gold }}/h expected">
+        <input type="hidden" name="route" value='{{ c.route.to_dict() | tojson }}'>
+        {% set main = (ev.lines | selectattr('item_id') | sort(attribute='value', reverse=True) | first) %}
+        {% if main %}<input type="hidden" name="item" value="{{ main.item_id }}">{% endif %}
+        <button type="submit" class="skip">Send route to game</button>
+        <span class="small muted">{{ c.route.points | length }} stops; shows in RXPGuides after /reload</span>
+      </form>
+      {% endif %}
       <div class="small muted">id <code>{{ m.id }}</code></div>
     </div>
   </details>
@@ -231,6 +244,13 @@
   </form>
 
   <section>
+    {% if route_msg %}{% set kind, _, what = route_msg.partition(":") %}
+    <div class="note {{ 'ok' if kind in ('sent', 'removed') else 'warn' }}">
+      {% if kind == "sent" %}Sent "{{ what }}" to the game. Type <code>/reload</code> in WoW, then open RXPGuides' guide list: <strong>WowGold farms</strong>.
+      {% elif kind == "removed" %}Route removed (gone from RXPGuides after <code>/reload</code>).
+      {% elif kind == "noaddon" %}Kept "{{ what }}", but the WowGoldLogger addon folder wasn't found, so nothing reached the game. Install the addon, or set <code>WOWGOLD_ADDON_DIR</code> in <code>.env</code>.
+      {% else %}{{ what }}{% endif %}</div>
+    {% endif %}
     {% if saved_msg == "1" %}<div class="note ok">Saved as your profile.</div>
     {% elif saved_msg == "error" %}<div class="note bad">Couldn't save: class, faction and level are needed.</div>{% endif %}
     {% for e in form.errors %}<div class="note bad">{{ e }}</div>{% endfor %}
@@ -292,6 +312,16 @@
           {% else %}<p class="muted small">None yet. Capture Forever-only items on the <a href="/capture">Capture</a> page.</p>{% endif %}
         {% endif %}
       {% endif %}
+    {% endif %}
+    {% if routes %}
+    <h2 id="routes">Routes in the game</h2>
+    <p class="muted small">Sent to the WowGoldLogger addon{% if not addon_found %} <strong>(addon folder not found: install it, or set <code>WOWGOLD_ADDON_DIR</code>)</strong>{% endif %}. In WoW, <code>/reload</code>, then pick one in RXPGuides' guide list under <strong>WowGold farms</strong>; <code>/wgl routes</code> lists them.</p>
+    <div class="panel scroll" style="padding:0"><table>
+      {% for r in routes %}
+      <tr><td><strong>{{ r.name }}</strong> <span class="small muted">{{ r.zone }} · {{ r.points | length }} stops · sent {{ r.sent_at[:16] | replace("T", " ") }}</span></td>
+        <td style="text-align:right"><form method="post" action="/farms/route/remove" style="display:inline"><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="skip">remove</button></form></td></tr>
+      {% endfor %}
+    </table></div>
     {% endif %}
   </section>
 </div>

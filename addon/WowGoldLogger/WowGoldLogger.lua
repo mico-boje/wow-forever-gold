@@ -27,6 +27,24 @@ local MAX_RECORDINGS = 200
 Logger.VERSION = VERSION
 Logger.STALE_AFTER = STALE_AFTER
 
+-- Clients on the Midnight engine (Forever's) hide some values from addons during combat
+-- ("secret values") and don't let addons read the combat log at all.
+local function secret(v)
+    return issecretvalue ~= nil and issecretvalue(v) == true
+end
+Logger.secret = secret
+-- The combat log is only usable where secret values don't exist (older clients).
+Logger.useCombatLog = issecretvalue == nil
+
+-- Call a game function; nil if it fails or the answer is secret.
+local function safe(fn, ...)
+    if not fn then return nil end
+    local ok, a, b, c = pcall(fn, ...)
+    if not ok or secret(a) or secret(b) or secret(c) then return nil end
+    return a, b, c
+end
+Logger.safe = safe
+
 local function say(msg)
     DEFAULT_CHAT_FRAME:AddMessage(PREFIX .. msg)
 end
@@ -55,6 +73,7 @@ end
 
 -- "You receive loot: |cff...|Hitem:13463::...|h[Dreamfoil]|h|rx3." -> 13463, 3
 function Logger.parseLoot(msg)
+    if type(msg) ~= "string" or secret(msg) then return nil end
     if not lootMultiple then buildPatterns() end
     local link, count = msg:match(lootMultiple)
     if not link then
@@ -69,6 +88,7 @@ end
 
 -- "You loot 1 Gold, 20 Silver, 5 Copper" -> 12005
 function Logger.parseMoney(msg)
+    if type(msg) ~= "string" or secret(msg) then return 0 end
     if not moneyParts then buildPatterns() end
     local total = 0
     for _, part in ipairs(moneyParts) do
@@ -80,7 +100,7 @@ end
 
 -- "Creature-0-4372-0-17-7105-0000ABCDEF" -> "Creature", 7105, "0000ABCDEF"
 function Logger.parseGuid(guid)
-    if type(guid) ~= "string" then return nil end
+    if secret(guid) or type(guid) ~= "string" then return nil end
     local kind, id, uid = guid:match("^(%a+)%-%d+%-%d+%-%d+%-%d+%-(%d+)%-(%x+)$")
     if not kind then return nil end
     return kind, tonumber(id), uid
@@ -101,7 +121,7 @@ local function now() return time() end
 --   Q questId|xp|copper      U pause|resume|stop
 
 local function clean(v)
-    if v == nil then return "" end
+    if v == nil or secret(v) then return "" end
     return (tostring(v):gsub("|", "/"))
 end
 
@@ -166,13 +186,14 @@ end
 local lastPos = {}
 
 local function position()
-    local mapId = C_Map and C_Map.GetBestMapForUnit and C_Map.GetBestMapForUnit("player")
-    if not mapId or not C_Map.GetPlayerMapPosition then return mapId end
-    local pos = C_Map.GetPlayerMapPosition(mapId, "player")
+    if not C_Map then return nil end
+    local mapId = safe(C_Map.GetBestMapForUnit, "player")
+    if not mapId then return nil end
+    local pos = safe(C_Map.GetPlayerMapPosition, mapId, "player")
     if not pos then return mapId end
     local x, y
-    if pos.GetXY then x, y = pos:GetXY() else x, y = pos.x, pos.y end
-    if not x or not y then return mapId end
+    if pos.GetXY then x, y = safe(pos.GetXY, pos) else x, y = pos.x, pos.y end
+    if type(x) ~= "number" or type(y) ~= "number" or secret(x) or secret(y) then return mapId end
     return mapId, round(x * 100, 2), round(y * 100, 2)
 end
 Logger.position = position
@@ -254,7 +275,7 @@ function Logger.start(note)
     }
     db.current = rec
     lastPos = {}
-    lastXp = UnitXP and UnitXP("player")
+    lastXp = safe(UnitXP, "player")
     logZone()
     logPosition(true)
     if GetMoney then log("$", GetMoney()) end
@@ -315,6 +336,39 @@ end
 
 -- Events --------------------------------------------------------------------------------
 
+-- Kills. Each mob is counted once (by its spawn uid), from whichever sign comes first:
+-- the combat log (older clients), you looting its corpse, or your target / a nameplate dying
+-- while tapped by you. A mob that dies tapped by someone else is logged as "D".
+local function seen(uid)
+    rec.guids = rec.guids or {}
+    if rec.guids[uid] then return true end
+    rec.guids[uid] = true
+    return false
+end
+
+local function logKill(id, uid)
+    if seen(uid) then return end
+    local _, x, y = position()
+    log("K", id, uid, x, y)
+    rec.kills = (rec.kills or 0) + 1
+    notify()
+end
+Logger.logKill = logKill
+
+-- A unit token (target, nameplateN) that might be a dead mob.
+function Logger.checkUnit(unit)
+    local kind, id, uid = Logger.parseGuid((safe(UnitGUID, unit)))
+    if kind ~= "Creature" or not uid then return end
+    if safe(UnitIsDead, unit) ~= true then return end
+    if rec.guids and rec.guids[uid] then return end
+    if safe(UnitIsTapDenied, unit) == true then
+        seen(uid)
+        log("D", id, uid)
+    else
+        logKill(id, uid)
+    end
+end
+
 local function onCombatLog()
     local _, subevent, _, sourceGuid, _, _, _, destGuid = CombatLogGetCurrentEventInfo()
     if subevent ~= "PARTY_KILL" and subevent ~= "UNIT_DIED" then return end
@@ -322,25 +376,24 @@ local function onCombatLog()
     if kind ~= "Creature" and kind ~= "Vehicle" then return end
     if subevent == "PARTY_KILL" then
         if sourceGuid ~= UnitGUID("player") and sourceGuid ~= UnitGUID("pet") then return end
-        local _, x, y = position()
-        log("K", id, uid, x, y)
-        rec.kills = (rec.kills or 0) + 1
-        notify()
+        logKill(id, uid)
     else
         log("D", id, uid)
     end
 end
 
 local function onLootOpened()
-    local n = GetNumLootItems and GetNumLootItems() or 0
-    local kind, id, uid = Logger.parseGuid(GetLootSourceInfo and n > 0 and (GetLootSourceInfo(1)) or nil)
+    local n = safe(GetNumLootItems) or 0
+    local kind, id, uid = Logger.parseGuid(n > 0 and (safe(GetLootSourceInfo, 1)) or nil)
+    -- looting a corpse means you killed it (corpses you didn't tap can't be looted)
+    if kind == "Creature" and uid then logKill(id, uid) end
     log("L", kind, id, uid, n)
     for slot = 1, n do
-        local link = GetLootSlotLink and GetLootSlotLink(slot)
-        local itemId = link and link:match("item:(%d+)")
-        local qty = 0
-        if GetLootSlotInfo then qty = select(3, GetLootSlotInfo(slot)) or 0 end
-        local sk, sid, suid = Logger.parseGuid(GetLootSourceInfo and (GetLootSourceInfo(slot)) or nil)
+        local link = safe(GetLootSlotLink, slot)
+        local itemId = type(link) == "string" and link:match("item:(%d+)") or nil
+        local _, _, qty = safe(GetLootSlotInfo, slot)
+        qty = qty or 0
+        local sk, sid, suid = Logger.parseGuid((safe(GetLootSourceInfo, slot)))
         log("S", slot, itemId, qty, sk, sid, suid)
     end
 end
@@ -368,6 +421,8 @@ function Logger.onEvent(event, ...)
     if not rec or rec.paused then return end
     if event == "COMBAT_LOG_EVENT_UNFILTERED" then
         onCombatLog()
+    elseif event == "NAME_PLATE_UNIT_REMOVED" or event == "UNIT_FLAGS" then
+        Logger.checkUnit(arg1)
     elseif event == "LOOT_OPENED" then
         onLootOpened()
     elseif event == "CHAT_MSG_LOOT" then
@@ -389,7 +444,7 @@ function Logger.onEvent(event, ...)
         logZone()
         logPosition(true)
     elseif event == "PLAYER_XP_UPDATE" then
-        local xp = UnitXP and UnitXP("player")
+        local xp = safe(UnitXP, "player")
         if xp and lastXp and xp > lastXp then log("X", xp - lastXp) end
         lastXp = xp
     elseif event == "PLAYER_LEVEL_UP" then
@@ -409,8 +464,14 @@ end
 
 -- Position sampling: an OnUpdate timer, POS_INTERVAL seconds apart.
 local sinceSample = 0
+local sinceTarget = 0
 function Logger.onUpdate(elapsedSecs)
     if not rec or rec.paused then return end
+    sinceTarget = sinceTarget + elapsedSecs
+    if sinceTarget >= 1 then
+        sinceTarget = 0
+        Logger.checkUnit("target")
+    end
     sinceSample = sinceSample + elapsedSecs
     if sinceSample >= POS_INTERVAL then
         sinceSample = 0
@@ -420,14 +481,17 @@ function Logger.onUpdate(elapsedSecs)
 end
 
 local events = CreateFrame("Frame")
-for _, e in ipairs({
-    "ADDON_LOADED", "COMBAT_LOG_EVENT_UNFILTERED", "LOOT_OPENED", "CHAT_MSG_LOOT",
+local wanted = {
+    "ADDON_LOADED", "LOOT_OPENED", "CHAT_MSG_LOOT",
     "CHAT_MSG_MONEY", "PLAYER_MONEY", "UNIT_SPELLCAST_SUCCEEDED", "PLAYER_REGEN_DISABLED",
     "PLAYER_REGEN_ENABLED", "ZONE_CHANGED_NEW_AREA", "ZONE_CHANGED", "PLAYER_XP_UPDATE",
     "PLAYER_LEVEL_UP", "CHAT_MSG_SKILL", "PLAYER_DEAD", "PLAYER_ALIVE", "PLAYER_UNGHOST",
-    "QUEST_TURNED_IN",
-}) do
-    events:RegisterEvent(e)
+    "QUEST_TURNED_IN", "NAME_PLATE_UNIT_REMOVED", "UNIT_FLAGS",
+}
+-- Registering the combat log is forbidden for addons on the Midnight engine.
+if Logger.useCombatLog then table.insert(wanted, "COMBAT_LOG_EVENT_UNFILTERED") end
+for _, e in ipairs(wanted) do
+    pcall(events.RegisterEvent, events, e) -- an event this client doesn't have is skipped
 end
 events:SetScript("OnEvent", function(_, event, ...) Logger.onEvent(event, ...) end)
 events:SetScript("OnUpdate", function(_, e) Logger.onUpdate(e) end)
@@ -446,7 +510,9 @@ SlashCmdList["WOWGOLDLOGGER"] = function(input)
         else say("/wgl start [note] | pause | resume | stop | status") end
     elseif cmd == "minimap" then
         if Logger.ui then Logger.ui.minimap() end
+    elseif cmd == "routes" then
+        if Logger.routes then Logger.routes.list() end
     else
-        say("/wgl (panel) | start [note] | pause | resume | stop | status | minimap (button on/off)")
+        say("/wgl (panel) | start [note] | pause | resume | stop | status | routes | minimap")
     end
 end

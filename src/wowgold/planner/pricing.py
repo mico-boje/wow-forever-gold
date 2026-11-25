@@ -26,6 +26,11 @@ def ah_cut(faction: str | None) -> float:
 LISTED_FRACTION_SOLD_PER_DAY = 0.25
 # Minimum hours of sales data before we trust the measured daily volume.
 MIN_SALES_COVERAGE_H = 12
+# An AH price resting on fewer auctions and units than this, with no sale seen in a week,
+# isn't a market price (one troll listing of a rare drop at 3,500g): such items are valued at
+# vendor price until a sale proves the price.
+THIN_AUCTIONS = 3
+THIN_QUANTITY = 10
 
 
 @dataclass(frozen=True)
@@ -40,10 +45,24 @@ class ItemPrice:
     absorb_per_day: float  # measured or estimated units/day the market takes
     absorb_measured: bool
     cut: float = AH_CUT  # the house's cut on sales
+    auctions: int | None = None  # auctions behind `market` (None: unknown)
+    sold_7d: int = 0  # units seen selling in the last 7 days
     trend: Trend | None = None
     # What a unit you farm or craft now will fetch when it sells: today's price, lowered for a
     # falling trend (see market.trends). Buying uses today's price.
     sell_factor: float = 1.0
+
+    @property
+    def thin(self) -> bool:
+        """Too few listings and no sales to trust the AH price for selling."""
+        return (
+            self.market is not None
+            and self.auctions is not None
+            and self.auctions < THIN_AUCTIONS
+            and self.listed_qty < THIN_QUANTITY
+            and not (self.sold_per_day or 0) > 0
+            and not self.sold_7d
+        )
 
     @property
     def sell_market(self) -> int | None:
@@ -51,7 +70,11 @@ class ItemPrice:
 
     @property
     def ah_net(self) -> int | None:
-        return round(self.market * self.sell_factor * (1 - self.cut)) if self.market else None
+        """What one unit nets on the AH when you sell it; None if it can't be sold there
+        (not listed, or a thin market)."""
+        if not self.market or self.thin:
+            return None
+        return round(self.market * self.sell_factor * (1 - self.cut))
 
     @property
     def sell_value(self) -> int:
@@ -117,18 +140,19 @@ def build_price_book(
     ids = sorted(item_ids)
     item_marks = ",".join("?" * len(ids))
 
-    current: dict[int, tuple[int, int]] = {}  # item -> (sum(market*qty), qty)
+    current: dict[int, tuple[int, int, int]] = {}  # item -> (sum(market*qty), qty, auctions)
     if snap_ids:
         snap_marks = ",".join("?" * len(snap_ids))
-        for item_id, weighted, qty in conn.execute(
+        for item_id, weighted, qty, n_auctions in conn.execute(
             f"""
-            SELECT item_id, SUM(market_unit * quantity), SUM(quantity) FROM price_stats
+            SELECT item_id, SUM(market_unit * quantity), SUM(quantity), SUM(num_auctions)
+            FROM price_stats
             WHERE snapshot_id IN ({snap_marks}) AND item_id IN ({item_marks}) AND quantity > 0
             GROUP BY item_id
             """,
             (*snap_ids, *ids),
         ):
-            current[item_id] = (weighted, qty)
+            current[item_id] = (weighted, qty, n_auctions)
 
     # Sales over the last 24h; coverage = span of snapshots that carried a sales diff.
     since = (now - timedelta(hours=24)).isoformat(timespec="seconds")
@@ -158,6 +182,20 @@ def build_price_book(
         ):
             sold[item_id] = qty or 0
 
+    week = (now - timedelta(days=7)).isoformat(timespec="seconds")
+    sold_7d = {
+        item_id: n or 0
+        for item_id, n in conn.execute(
+            f"""
+            SELECT item_id, SUM(sold_qty) FROM price_stats
+            WHERE region = ? AND house_id IN ({house_marks}) AND item_id IN ({item_marks})
+              AND ts >= ? AND sold_qty > 0
+            GROUP BY item_id
+            """,
+            (region, *house_ids, *ids, week),
+        )
+    }
+
     meta = {
         r[0]: r[1:]
         for r in conn.execute(
@@ -170,7 +208,7 @@ def build_price_book(
     book.maturity = load_maturity(conn, region, house_ids, book.sales_coverage_h, now=now)
     trend_of = load_trends(conn, region, house_ids, item_ids, now=now) if trends else {}
     for item_id in ids:
-        weighted, qty = current.get(item_id, (0, 0))
+        weighted, qty, n_auctions = current.get(item_id, (0, 0, 0))
         name, sell, buy = meta.get(item_id, (None, None, None))
         sold_per_day = (
             sold.get(item_id, 0) * 24 / book.sales_coverage_h if book.sales_coverage_h else None
@@ -191,6 +229,8 @@ def build_price_book(
             absorb_per_day=absorb,
             absorb_measured=measured and sold_per_day is not None,
             cut=book.cut,
+            auctions=n_auctions or 0,
+            sold_7d=sold_7d.get(item_id, 0),
             trend=(t := trend_of.get(item_id)),
             sell_factor=t.sell_factor if t else 1.0,
         )
@@ -265,3 +305,17 @@ def trend_flags(book: PriceBook, item_ids, *, max_items: int = 3) -> list[str]:
         more = f" +{len(swinging) - max_items}" if len(swinging) > max_items else ""
         out.append(f"prices swing a lot: {names}{more}; time your sales")
     return out
+
+
+def thin_note(p: ItemPrice) -> str:
+    listed = f"{p.auctions} listing" + ("s" if p.auctions != 1 else "")
+    return (
+        f"{p.name or f'item {p.item_id}'}: {listed} at {p.market / 10000:,.0f}g and no sales "
+        "seen, so valued at vendor price"
+    )
+
+
+def thin_flags(book: PriceBook, item_ids) -> list[str]:
+    """Items a plan would sell whose AH price is a thin market (valued at vendor instead)."""
+    thin = [book.get(i) for i in dict.fromkeys(item_ids) if book.get(i).thin]
+    return [thin_note(p) for p in sorted(thin, key=lambda p: -(p.market or 0))[:3]]

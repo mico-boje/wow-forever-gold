@@ -107,6 +107,14 @@ CREATE TABLE IF NOT EXISTS items (
 
 CREATE INDEX IF NOT EXISTS ix_items_name ON items (name COLLATE NOCASE);
 
+-- When each item was first listed (kept up to date by ingest; outlives pruned hourly rows).
+CREATE TABLE IF NOT EXISTS item_first_seen (
+    region    TEXT NOT NULL,
+    item_id   INTEGER NOT NULL,
+    first_ts  TEXT NOT NULL,
+    PRIMARY KEY (region, item_id)
+);
+
 -- Measured play sessions, used to calibrate method yields (Phase 4).
 CREATE TABLE IF NOT EXISTS sessions (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,

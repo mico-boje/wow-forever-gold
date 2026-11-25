@@ -114,6 +114,14 @@ def ingest_pending(conn: sqlite3.Connection) -> IngestSummary:
             "INSERT OR REPLACE INTO price_stats VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows
         )
         conn.execute(
+            """INSERT INTO item_first_seen (region, item_id, first_ts)
+               SELECT region, item_id, MIN(ts) FROM price_stats
+               WHERE snapshot_id = ? AND quantity > 0 GROUP BY item_id
+               ON CONFLICT(region, item_id) DO UPDATE
+                 SET first_ts = MIN(first_ts, excluded.first_ts)""",
+            (snap["id"],),
+        )
+        conn.execute(
             "UPDATE snapshots SET ingested_at = ? WHERE id = ?",
             (datetime.now(UTC).isoformat(timespec="seconds"), snap["id"]),
         )
